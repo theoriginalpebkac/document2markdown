@@ -2,9 +2,13 @@
 """doc2md.py — batch-convert a folder of documents to Markdown with per-file
 quality validation, visual (figure/table) extraction, and a summary report.
 
-Conversion
-    * PDF              -> pdfmux  (per-page self-healing extraction + confidence)
-    * DOCX/HTML/EPUB/RTF -> pandoc
+Conversion (handler chosen by content sniffing, not extension)
+    * PDF                       -> pdfmux (per-page self-healing + confidence)
+    * .docx (Word, Google Docs) -> pandoc (+ --extract-media)
+    * Confluence "Word" export  -> MHTML: extract HTML + base64 images -> pandoc
+    * config XML                -> verbatim (fenced, lossless, + index)
+    * documentation XML         -> transform (structured Markdown)
+    * HTML/EPUB/RTF/ODT         -> pandoc
 
     Maximum *local* effort is the default (pdfmux ``quality="standard"`` — the
     full agentic audit/re-extract loop). Cloud LLM extraction is opt-in via
@@ -88,9 +92,26 @@ DEFAULT_FIGURE_DPI = 150
 # suspicious.
 STRUCT_MIN_CHARS = 3000
 
-PANDOC_EXTENSIONS = {".docx", ".html", ".htm", ".epub", ".rtf", ".odt"}
+# Extensions worth *attempting*. The actual handler is chosen by content
+# sniffing (detect_format), not the extension — e.g. a Confluence ".doc" is
+# really MHTML, and ".xml" may be config or documentation.
 PDF_EXTENSIONS = {".pdf"}
-SUPPORTED_EXTENSIONS = PDF_EXTENSIONS | PANDOC_EXTENSIONS
+WORD_EXTENSIONS = {".docx", ".doc", ".mht", ".mhtml"}
+XML_EXTENSIONS = {".xml"}
+PANDOC_EXTENSIONS = {".html", ".htm", ".epub", ".rtf", ".odt"}
+SUPPORTED_EXTENSIONS = (
+    PDF_EXTENSIONS | WORD_EXTENSIONS | XML_EXTENSIONS | PANDOC_EXTENSIONS
+)
+
+# Embedded raster images smaller than this (max dimension in px, or byte size
+# when dimensions can't be read) are treated as UI icons/badges and skipped.
+WORD_IMAGE_MIN_PX = 64
+WORD_IMAGE_MIN_BYTES = 12000
+
+# An XML document is treated as "documentation" (transform mode) rather than
+# "config" (verbatim mode) when at least this fraction of its elements are
+# prose/markup tags.
+XML_PROSE_TAG_RATIO = 0.15
 
 
 @dataclass(frozen=True)
@@ -717,6 +738,412 @@ def convert_with_pandoc(src: Path, dest: Path) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# Format detection (content sniffing, not extension)
+# --------------------------------------------------------------------------- #
+
+_MIME_HEADER_RE = re.compile(
+    r"(?is)^\s*(from|date|message-id|subject|mime-version|content-type)\s*:"
+)
+
+
+def detect_format(path: Path) -> str:
+    """Classify a file by *content*, returning one of:
+
+    ``pdf``, ``docx``, ``mhtml``, ``doc-binary``, ``xml``, ``pandoc``,
+    ``unsupported``. Extensions lie (Confluence "Word" is MHTML named ``.doc``),
+    so we sniff magic bytes / structure first and fall back to the extension.
+    """
+    try:
+        head = path.read_bytes()[:4096]
+    except OSError:
+        return "unsupported"
+
+    if head[:4] == b"%PDF":
+        return "pdf"
+    if head[:4] == b"PK\x03\x04":  # zip container
+        try:
+            import zipfile
+
+            with zipfile.ZipFile(path) as z:
+                names = set(z.namelist())
+            if "word/document.xml" in names:
+                return "docx"
+            if "mimetype" in names or any(n.startswith("OEBPS/") for n in names):
+                return "pandoc"  # epub / odt -> pandoc
+        except Exception:
+            return "unsupported"
+        return "unsupported"
+    if head[:4] == b"\xd0\xcf\x11\xe0":  # OLE2 -> legacy binary .doc/.xls
+        return "doc-binary"
+
+    text = head.decode("utf-8", "replace").lstrip("﻿").lstrip()
+    low = text.lower()
+    if text.startswith("<?xml") or path.suffix.lower() in XML_EXTENSIONS:
+        # XHTML is rare here; treat .xml / xml-declared content as XML.
+        if not low.startswith("<html") and "<html" not in low[:200]:
+            return "xml"
+    if _MIME_HEADER_RE.match(text) and ("multipart/related" in low or "mime-version" in low):
+        return "mhtml"
+    if path.suffix.lower() in (".mht", ".mhtml"):
+        return "mhtml"
+    if path.suffix.lower() in PANDOC_EXTENSIONS:
+        return "pandoc"
+    if path.suffix.lower() == ".docx":
+        return "docx"
+    return "unsupported"
+
+
+# --------------------------------------------------------------------------- #
+# Word / MHTML conversion (Confluence "Word" export is MHTML with base64 images)
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class WordConversion:
+    markdown: str
+    images: int
+    ref_plaintext: Optional[str]  # source text for the fidelity check
+
+
+def _sniff_image(data: bytes) -> Optional[str]:
+    """Return a file extension for raster/vector image bytes, or None."""
+    if data[:8].startswith(b"\x89PNG"):
+        return "png"
+    if data[:3] == b"\xff\xd8\xff":
+        return "jpg"
+    if data[:3] == b"GIF":
+        return "gif"
+    if data[:2] == b"BM":
+        return "bmp"
+    if data[:4] == b"\x01\x00\x00\x00" or data[40:44] == b" EMF":
+        return "emf"
+    if data[:4] == b"\xd7\xcd\xc6\x9a" or data[:4] == b"\x01\x00\x09\x00":
+        return "wmf"
+    return None
+
+
+def _image_dims(data: bytes, fmt: str) -> Optional[Tuple[int, int]]:
+    """Best-effort (width, height) from raster image bytes; None if unknown."""
+    try:
+        if fmt == "png":
+            return int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big")
+        if fmt == "gif":
+            return int.from_bytes(data[6:8], "little"), int.from_bytes(data[8:10], "little")
+        if fmt == "bmp":
+            return int.from_bytes(data[18:22], "little"), int.from_bytes(data[22:26], "little")
+        if fmt == "jpg":
+            i = 2
+            while i < len(data) - 9:
+                if data[i] != 0xFF:
+                    i += 1
+                    continue
+                marker = data[i + 1]
+                if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+                    return (
+                        int.from_bytes(data[i + 7:i + 9], "big"),
+                        int.from_bytes(data[i + 5:i + 7], "big"),
+                    )
+                i += 2 + int.from_bytes(data[i + 2:i + 4], "big")
+    except Exception:
+        pass
+    return None
+
+
+def _image_is_content(data: bytes, fmt: str) -> bool:
+    """Keep real figures, drop tiny UI icons/badges.
+
+    Confluence chrome (emoticons, status badges, expand arrows) is small in both
+    byte size and dimensions, while real screenshots/diagrams are large. Byte
+    size is the most reliable discriminator (a simple PNG can be ≥64px yet only
+    a few KB), backed by a pixel-dimension floor.
+    """
+    if len(data) < WORD_IMAGE_MIN_BYTES:
+        return False
+    dims = _image_dims(data, fmt)
+    return dims is None or min(dims) >= WORD_IMAGE_MIN_PX
+
+
+def extract_mhtml(path: Path) -> Tuple[str, List[Tuple[str, bytes]]]:
+    """Parse an MHTML file into ``(html, [(part_key, bytes), ...])``.
+
+    ``part_key`` is the Content-Location basename (or Content-ID) — note it can
+    be a *prefix* of the ``<img src>`` hash, so callers resolve by prefix.
+    """
+    import email
+
+    msg = email.message_from_bytes(path.read_bytes())
+    html = ""
+    images: List[Tuple[str, bytes]] = []
+    for part in msg.walk():
+        ctype = part.get_content_type()
+        if ctype == "text/html" and not html:
+            html = part.get_payload(decode=True).decode(
+                part.get_content_charset() or "utf-8", "replace"
+            )
+        elif part.get_content_maintype() in ("application", "image"):
+            data = part.get_payload(decode=True)
+            if not data:
+                continue
+            ref = part.get("Content-Location", "") or part.get("Content-ID", "")
+            key = ref.split("/")[-1].strip("<>")
+            images.append((key, data))
+    return html, images
+
+
+def _resolve_img_src(src: str, key_to_rel: Dict[str, str]) -> Optional[str]:
+    """Match an <img> src against part keys by equality or prefix."""
+    for key, rel in key_to_rel.items():
+        if src == key or src.startswith(key) or key.startswith(src):
+            return rel
+    return None
+
+
+def _rewrite_img_srcs(html: str, key_to_rel: Dict[str, str]) -> str:
+    """Point <img> tags at extracted local figures; drop unresolved ones."""
+
+    def repl(m: "re.Match") -> str:
+        tag = m.group(0)
+        sm = re.search(r'src\s*=\s*["\']?([^"\'> ]+)', tag, re.I)
+        if not sm:
+            return ""
+        rel = _resolve_img_src(sm.group(1), key_to_rel)
+        if rel is None:
+            return ""  # filtered icon / unresolved -> remove tag
+        return tag[: sm.start(1)] + rel + tag[sm.end(1):]
+
+    return re.sub(r"<img\b[^>]*>", repl, html, flags=re.I)
+
+
+def _strip_html(html: str) -> str:
+    """Crude HTML -> plain text for the fidelity comparison (no deps)."""
+    import html as _h
+
+    text = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", html)
+    text = re.sub(r"(?s)<[^>]+>", " ", text)
+    return _h.unescape(text)
+
+
+def html_to_markdown(html: str, have_pandoc: bool) -> str:
+    """Convert an HTML string to GFM via pandoc (stdin)."""
+    if not have_pandoc:
+        raise RuntimeError(
+            "pandoc is required to convert Word/HTML content to Markdown; "
+            "install pandoc (see requirements.txt)."
+        )
+    proc = subprocess.run(
+        ["pandoc", "-f", "html", "-t", "gfm", "--wrap=none"],
+        input=html,
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError("pandoc html->md failed: %s" % proc.stderr.strip())
+    return proc.stdout
+
+
+def convert_word(
+    src: Path,
+    dest: Path,
+    fmt: str,
+    *,
+    have_pandoc: bool,
+    visual_cfg: Optional[VisualConfig] = None,
+) -> WordConversion:
+    """Convert a Word-family document (OOXML ``.docx`` or Confluence MHTML)."""
+    cfg = visual_cfg or VisualConfig()
+    slug = dest.stem
+    fig_dir = dest.parent / slug / "figures"
+    rel_base = "%s/figures" % slug
+    dest.parent.mkdir(parents=True, exist_ok=True)
+
+    if fmt == "mhtml":
+        html, parts = extract_mhtml(src)
+        ref_plaintext = _strip_html(html)
+        key_to_rel: Dict[str, str] = {}
+        n = 0
+        if cfg.enabled and cfg.extract_images:
+            idx = 0
+            for key, data in parts:
+                ifmt = _sniff_image(data)
+                if ifmt is None or ifmt in ("emf", "wmf"):
+                    continue  # unknown or unrenderable vector -> skip
+                if not _image_is_content(data, ifmt):
+                    continue  # tiny icon/badge
+                idx += 1
+                fig_dir.mkdir(parents=True, exist_ok=True)
+                fname = "%s-figure%02d.%s" % (slug, idx, ifmt)
+                (fig_dir / fname).write_bytes(data)
+                key_to_rel[key] = "%s/%s" % (rel_base, fname)
+                n += 1
+        html = _rewrite_img_srcs(html, key_to_rel)
+        markdown = html_to_markdown(html, have_pandoc)
+        return WordConversion(markdown=markdown, images=n, ref_plaintext=ref_plaintext)
+
+    if fmt == "docx":
+        if not have_pandoc:
+            raise RuntimeError("pandoc is required to convert .docx; see requirements.txt.")
+        args = ["pandoc", "-f", "docx", "-t", "gfm", "--wrap=none"]
+        media_root = dest.parent / slug
+        if cfg.enabled and cfg.extract_images:
+            args += ["--extract-media", str(media_root)]
+        args.append(str(src))
+        proc = subprocess.run(args, capture_output=True, text=True)
+        if proc.returncode != 0:
+            raise RuntimeError("pandoc docx->md failed: %s" % proc.stderr.strip())
+        markdown = proc.stdout
+        media_dir = media_root / "media"
+        n = len(list(media_dir.glob("*"))) if media_dir.is_dir() else 0
+        ref = subprocess.run(
+            ["pandoc", "-f", "docx", "-t", "plain", "--wrap=none", str(src)],
+            capture_output=True,
+            text=True,
+        )
+        ref_plaintext = ref.stdout if ref.returncode == 0 else None
+        return WordConversion(markdown=markdown, images=n, ref_plaintext=ref_plaintext)
+
+    raise RuntimeError("unhandled Word format: %s" % fmt)
+
+
+# --------------------------------------------------------------------------- #
+# XML conversion — verbatim (config, syntax-critical) or transform (doc)
+# --------------------------------------------------------------------------- #
+
+_XML_INLINE_TAGS = {"b", "i", "em", "strong", "br", "link", "a", "code", "tt", "u", "sub", "sup"}
+
+
+def _xml_local(elem) -> str:
+    return elem.tag.split("}")[-1] if isinstance(elem.tag, str) else "_"
+
+
+def _xml_attrs(elem) -> str:
+    return " ".join('%s="%s"' % (k.split("}")[-1], v) for k, v in elem.attrib.items())
+
+
+def xml_choose_mode(path: Path, raw: str) -> str:
+    """Auto-pick 'transform' (documentation) vs 'verbatim' (config)."""
+    import xml.etree.ElementTree as ET
+    from collections import Counter
+
+    try:
+        root = ET.fromstring(raw)
+    except Exception:
+        return "verbatim"
+    tags: "Counter" = Counter(_xml_local(e) for e in root.iter())
+    total = sum(tags.values())
+    prose = sum(tags[t] for t in ("doc", "p", "li", "dt", "dd", "b", "br", "para", "section"))
+    return "transform" if total and prose / total >= XML_PROSE_TAG_RATIO else "verbatim"
+
+
+def xml_to_markdown_verbatim(path: Path, raw: str) -> str:
+    """Lossless: the XML is preserved exactly inside a fenced block, with a
+    generated index of top-level elements for navigation. For syntax-critical
+    configuration where exact tags/attributes/values matter."""
+    import xml.etree.ElementTree as ET
+
+    index: List[str] = []
+    try:
+        root = ET.fromstring(raw)
+        for child in list(root)[:300]:
+            tag = _xml_local(child)
+            label = child.get("name") or child.findtext("name") or child.get("id") or ""
+            index.append("- `%s`%s" % (tag, " — %s" % label if label else ""))
+    except Exception:
+        pass
+
+    out = ["# %s" % path.stem, "", "_Configuration XML — preserved verbatim below._", ""]
+    if index:
+        out += ["## Index", ""] + index + [""]
+    out += ["## Source", "", "```xml", raw.rstrip(), "```", ""]
+    return "\n".join(out)
+
+
+def _xml_inline_text(elem) -> str:
+    """Serialize an element's mixed content with light Markdown formatting."""
+    parts: List[str] = []
+    if elem.text:
+        parts.append(elem.text)
+    for child in elem:
+        name = _xml_local(child)
+        inner = _xml_inline_text(child)
+        if name in ("b", "strong"):
+            parts.append("**%s**" % inner if inner else "")
+        elif name in ("i", "em"):
+            parts.append("*%s*" % inner if inner else "")
+        elif name == "br":
+            parts.append("  \n")
+        elif name in ("link", "a"):
+            href = child.get("href") or child.get("id") or ""
+            parts.append("[%s](%s)" % (inner or href, href) if href else inner)
+        elif name in ("code", "tt"):
+            parts.append("`%s`" % inner if inner else "")
+        else:
+            parts.append(inner)
+        if child.tail:
+            parts.append(child.tail)
+    return re.sub(r"[ \t]+", " ", "".join(parts)).strip()
+
+
+def _xml_is_container(elem) -> bool:
+    return any(_xml_local(c) not in _XML_INLINE_TAGS for c in elem)
+
+
+def _render_xml_node(elem, lines: List[str], depth: int) -> None:
+    name = _xml_local(elem)
+    attrs = _xml_attrs(elem)
+    if not _xml_is_container(elem):
+        text = _xml_inline_text(elem)
+        label = "**%s**%s" % (name, " (%s)" % attrs if attrs else "")
+        if text:
+            lines.append("- %s: %s" % (label, text))
+        elif attrs:
+            lines.append("- %s" % label)
+        return
+    heading = "#" * min(depth + 1, 6)
+    lines += ["", "%s %s%s" % (heading, name, " (%s)" % attrs if attrs else ""), ""]
+    if elem.text and elem.text.strip():
+        lines.append(elem.text.strip())
+    for child in elem:
+        if _xml_local(child) in _XML_INLINE_TAGS:
+            inline = _xml_inline_text(child)
+            if inline:
+                lines.append(inline)
+        else:
+            _render_xml_node(child, lines, depth + 1)
+        if child.tail and child.tail.strip():
+            lines.append(child.tail.strip())
+
+
+def xml_to_markdown_transform(path: Path, raw: str) -> str:
+    """Render documentation-style XML as navigable Markdown (headings/lists)."""
+    import xml.etree.ElementTree as ET
+
+    root = ET.fromstring(raw)
+    lines: List[str] = ["# %s" % path.stem, ""]
+    _render_xml_node(root, lines, depth=1)
+    return "\n".join(lines)
+
+
+def convert_xml(src: Path, dest: Path, mode: str = "auto") -> Tuple[str, str]:
+    """Convert XML to Markdown. ``mode`` is auto | verbatim | transform.
+
+    Returns ``(markdown, mode_used)``. Verbatim is lossless and the safe default
+    for unknown/config XML; transform is for documentation-style XML.
+    """
+    raw = src.read_text(encoding="utf-8", errors="replace")
+    chosen = xml_choose_mode(src, raw) if mode == "auto" else mode
+    if chosen == "transform":
+        try:
+            markdown = xml_to_markdown_transform(src, raw)
+        except Exception:
+            markdown, chosen = xml_to_markdown_verbatim(src, raw), "verbatim"
+    else:
+        markdown = xml_to_markdown_verbatim(src, raw)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(markdown, encoding="utf-8")
+    return markdown, chosen
+
+
+# --------------------------------------------------------------------------- #
 # Validation
 # --------------------------------------------------------------------------- #
 
@@ -877,20 +1304,31 @@ def process_file(
     min_confidence: float = DEFAULT_MIN_CONFIDENCE,
     preview_pages: Optional[int] = None,
     visual_cfg: Optional[VisualConfig] = None,
+    xml_mode: str = "auto",
     used_llm: bool = False,
 ) -> FileRecord:
-    """Convert + validate a single file. Never raises — errors go in the record."""
+    """Convert + validate a single file. Never raises — errors go in the record.
+
+    The handler is chosen by content sniffing (:func:`detect_format`), not the
+    extension — so a Confluence ``.doc`` (MHTML) and a config ``.xml`` route to
+    the right converter.
+    """
     record = FileRecord(
         filename=src.name,
         source_path=str(src),
         preview=preview_pages is not None,
         used_llm=used_llm,
     )
-    ext = src.suffix.lower()
 
-    if ext not in SUPPORTED_EXTENSIONS:
+    if src.suffix.lower() not in SUPPORTED_EXTENSIONS:
         record.status = "skipped"
-        record.error = "unsupported format: %s" % (ext or "<none>")
+        record.error = "unsupported format: %s" % (src.suffix.lower() or "<none>")
+        return record
+
+    fmt = detect_format(src)
+    if fmt in ("unsupported",):
+        record.status = "skipped"
+        record.error = "unrecognized content (%s)" % src.suffix.lower()
         return record
 
     dest = _output_path_for(src, input_root, output_dir)
@@ -899,7 +1337,7 @@ def process_file(
         original_plaintext: Optional[str] = None
         confidence: Optional[float] = None
 
-        if ext in PDF_EXTENSIONS:
+        if fmt == "pdf":
             if not deps.get("pdfmux"):
                 raise RuntimeError("pdfmux is not installed; cannot convert PDFs")
             record.converter = "pdfmux"
@@ -913,9 +1351,25 @@ def process_file(
             record.figures = _figure_counts(conv.visuals)
             if deps.get("pdftotext"):
                 original_plaintext = extract_pdf_plaintext(src, last_page=preview_pages)
-        else:
+        elif fmt in ("mhtml", "docx"):
+            record.converter = "mhtml" if fmt == "mhtml" else "pandoc(docx)"
+            wc = convert_word(
+                src, dest, fmt, have_pandoc=bool(deps.get("pandoc")), visual_cfg=visual_cfg
+            )
+            markdown = wc.markdown
+            original_plaintext = wc.ref_plaintext
+            record.figures = {"diagrams": 0, "images": wc.images, "complex_tables": 0}
+        elif fmt == "xml":
+            markdown, mode_used = convert_xml(src, dest, mode=xml_mode)
+            record.converter = "xml-%s" % mode_used
+        elif fmt == "doc-binary":
+            raise RuntimeError(
+                "legacy binary .doc (OLE) needs LibreOffice/antiword; not supported. "
+                "Re-save as .docx, or export from Confluence as PDF/Word(MHTML)."
+            )
+        else:  # pandoc: html/htm/epub/rtf/odt
             if not deps.get("pandoc"):
-                raise RuntimeError("pandoc is not installed; cannot convert %s" % ext)
+                raise RuntimeError("pandoc is not installed; cannot convert %s" % src.suffix)
             record.converter = "pandoc"
             markdown = convert_with_pandoc(src, dest)
 
@@ -1067,6 +1521,7 @@ def run_batch(
     min_confidence: float = DEFAULT_MIN_CONFIDENCE,
     preview_pages: Optional[int] = None,
     visual_cfg: Optional[VisualConfig] = None,
+    xml_mode: str = "auto",
     used_llm: bool = False,
     deps: Optional[Dict[str, bool]] = None,
 ) -> List[FileRecord]:
@@ -1105,6 +1560,7 @@ def run_batch(
                 min_confidence=min_confidence,
                 preview_pages=preview_pages,
                 visual_cfg=visual_cfg,
+                xml_mode=xml_mode,
                 used_llm=used_llm,
             ): f
             for f in files
@@ -1175,6 +1631,12 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="Render DPI for extracted PNGs (default: %d)" % DEFAULT_FIGURE_DPI,
     )
     parser.add_argument(
+        "--xml-mode", choices=("auto", "verbatim", "transform"), default="auto",
+        help="XML handling: 'verbatim' (fenced, lossless — for syntax-critical "
+        "config), 'transform' (structured Markdown — for documentation XML), or "
+        "'auto' (default: detect by content).",
+    )
+    parser.add_argument(
         "--preview", action="store_true",
         help="Quick sanity check: process only the first %d pages of each PDF."
         % DEFAULT_PREVIEW_PAGES,
@@ -1240,6 +1702,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         min_confidence=args.min_confidence,
         preview_pages=preview_pages,
         visual_cfg=visual_cfg,
+        xml_mode=args.xml_mode,
         used_llm=used_llm,
         deps=deps,
     )
