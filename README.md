@@ -57,7 +57,7 @@ token-bounded RAG chunker keeps the image and table in the same chunk:
 
 ```markdown
 > **[Table — p.7]** Rendered as image (authoritative); best-effort Markdown follows.
-> ![SRO Metrocache Design — page 7, complex table: Cache key fields](sro-metrocache-design/figures/sro-metrocache-design-p007-table01.png)
+> ![Network Design Spec — page 7, complex table: Field definitions](network-design-spec/figures/network-design-spec-p007-table01.png)
 
 | field | type | notes |
 | --- | --- | --- |
@@ -75,7 +75,7 @@ document `<Doc Name>.pdf` looks like:
 <output>/<doc-slug>/figures/<doc-slug>-p<PPP>-<kind><NN>.png
 ```
 
-- `<doc-slug>` e.g. `sro-metrocache-design`; the slug prefixes every PNG so files
+- `<doc-slug>` e.g. `network-design-spec`; the slug prefixes every PNG so files
   stay unique and traceable even if relocated by a RAG pipeline.
 - `p<PPP>` = 1-based page number (zero-padded); `<kind>` = `figure` / `table` /
   `diagram`; `<NN>` = per-page index.
@@ -158,7 +158,7 @@ reprocess generated output.
 python3 doc2md.py ./docs
 
 # Single file in, output defaults to its folder's markdown/
-python3 doc2md.py "./docs/SRO Metrocache Design.pdf"
+python3 doc2md.py "./docs/Network Design Spec.pdf"
 
 # Explicit output directory
 python3 doc2md.py ./docs ./out
@@ -191,9 +191,9 @@ folder.
   },
   "files": [
     {
-      "filename": "SRO Metrocache Design.pdf",
+      "filename": "Network Design Spec.pdf",
       "converter": "pdfmux", "status": "converted",
-      "output_path": "docs/markdown/sro-metrocache-design.md",
+      "output_path": "docs/markdown/network-design-spec.md",
       "similarity": 0.94, "pdfmux_confidence": 0.97, "min_page_confidence": 0.88,
       "structural": { "headings": 31, "code_blocks": 4, "tables": 12, "images": 10 },
       "figures": { "diagrams": 0, "images": 10, "complex_tables": 0 },
