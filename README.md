@@ -17,10 +17,23 @@ so they can be imported and unit-tested on their own.
 
 | Stage | What happens |
 | --- | --- |
-| **Convert** | PDFs go through [pdfmux](https://pypi.org/project/pdfmux/) (per-page self-healing extraction + confidence scoring). Everything else (DOCX/HTML/EPUB/RTF/ODT) is converted with [pandoc](https://pandoc.org/). Unsupported formats are logged and skipped. Files are processed in parallel (`--workers`, default 4). |
-| **Extract visuals** (PDF) | pdfmux emits no image references, so a PyMuPDF pass renders content that *can't* be represented as Markdown to PNG and references it inline (see below). |
-| **Validate** (PDF) | `pdftotext` raw text vs. the generated Markdown (syntax stripped) via `difflib.SequenceMatcher`; plus a pdfmux-confidence gate and a structural-emptiness check. |
+| **Detect** | Each file is classified by **content, not extension** — a Confluence "Word" export is really MHTML named `.doc`, and `.xml` may be config or documentation. |
+| **Convert** | Routed by detected type (table below). Unsupported formats are logged and skipped. Files are processed in parallel (`--workers`, default 4). |
+| **Extract visuals** | PDF: a PyMuPDF pass renders content with no faithful Markdown form to PNG. Word/MHTML: embedded raster images are recovered (UI icons filtered). |
+| **Validate** | PDF: `pdftotext` vs. generated Markdown via `difflib.SequenceMatcher` + pdfmux-confidence gate. Word: source text vs. Markdown similarity. All: structural-emptiness check. |
 | **Report** | `conversion_report.json` (per-file score, confidence, structural + figure counts, errors) and a ranked stdout summary. Non-zero exit if any file fails — usable as a CI gate. |
+
+### Formats and routing
+
+| Input (detected) | Converter | Notes |
+| --- | --- | --- |
+| **PDF** | [pdfmux](https://pypi.org/project/pdfmux/) + PyMuPDF figures | self-healing extraction + confidence; the image path |
+| **`.docx`** (Word, Google Docs) | [pandoc](https://pandoc.org/) (`--extract-media`) | semantic structure + embedded images |
+| **Confluence "Word" export** (MHTML, usually `.doc`) | extract HTML + base64 images (stdlib) → pandoc | images recovered & inlined; UI icons filtered |
+| **Config XML** (syntax-critical) | **verbatim** — fenced ```xml``` + generated index | lossless; exact tags/attributes/values preserved |
+| **Documentation XML** | **transform** — structured Markdown (headings/lists) | for XML that is really a document |
+| HTML / EPUB / RTF / ODT | pandoc | |
+| legacy binary `.doc` (OLE) | — | not supported; re-save as `.docx` or export PDF |
 
 ### Maximum local effort by default; LLM on demand
 
@@ -37,6 +50,23 @@ python3 doc2md.py ./docs ./out --llm gemini --llm-budget 0.50
 
 `ollama` keeps it fully local. The report flags which documents have
 low-confidence pages, so you know which ones to re-run with `--llm`.
+
+### Picking the best source format
+
+Every conversion hop can lose structure or images, so prefer the least-lossy
+export of a given document:
+
+- **Confluence / Jira** — export to **Word** for text-centric pages: it keeps
+  semantic headings/tables and (in the MHTML `.doc` variant) embeds images,
+  which doc2md recovers and inlines. Export to **PDF** when a page's diagrams are
+  drawn as native vectors that the Word export would rasterize poorly — the PDF
+  path captures those.
+- **Google Docs** — download as **`.docx`** (structure + images preserved). Avoid
+  the Markdown download: it drops images. (Zipped HTML is a fine alternative.)
+- **Akamai config XML** — feed the **XML directly**; don't pre-convert it to PDF.
+  doc2md keeps syntax-critical config verbatim, so exact tags/attributes/values
+  survive (which a PDF round-trip would mangle). The Markdown output is suitable
+  for tools like NotebookLM without the lossy PDF step.
 
 ### Figure & table extraction
 
@@ -113,7 +143,7 @@ pip install -r requirements.txt
 
 | Tool | Used for | Install |
 | --- | --- | --- |
-| **pandoc** | DOCX / HTML / EPUB / RTF / ODT → Markdown | macOS: `brew install pandoc` · Debian: `sudo apt-get install pandoc` |
+| **pandoc** | Word (`.docx` + Confluence MHTML), HTML / EPUB / RTF / ODT → Markdown | macOS: `brew install pandoc` · Debian: `sudo apt-get install pandoc` |
 | **pdftotext** (poppler-utils) | Raw text for the fidelity comparison. Without it PDFs still convert but get no similarity score. | macOS: `brew install poppler` · Debian: `sudo apt-get install poppler-utils` |
 
 `doc2md.py` checks for all of these on startup and prints install instructions
@@ -148,6 +178,7 @@ reprocess generated output.
 | `--no-figures` | off | Text-only Markdown (disable all image extraction). |
 | `--vector-diagrams` | off | Best-effort vector-diagram extraction (see caveat). |
 | `--figure-dpi N` | `150` | Render DPI for extracted PNGs. |
+| `--xml-mode {auto,verbatim,transform}` | `auto` | XML handling: `verbatim` (lossless, for config), `transform` (structured Markdown, for doc-XML), or auto-detect. |
 | `--preview` | off | Process only the first few pages of each PDF (quick sanity check). |
 | `--preview-pages N` | `3` | Pages to use with `--preview`. |
 
