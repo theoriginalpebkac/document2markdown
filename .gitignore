@@ -1,0 +1,15 @@
+# Local Claude Code context / settings (machine-specific, may reference internal paths)
+CLAUDE.local.md
+.claude/settings.local.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# doc2md run artifacts (in case output lands inside the repo)
+/markdown/
+conversion_report.json
+*_figures/
