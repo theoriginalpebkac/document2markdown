@@ -898,18 +898,25 @@ def _resolve_img_src(src: str, key_to_rel: Dict[str, str]) -> Optional[str]:
     return None
 
 
-def _rewrite_img_srcs(html: str, key_to_rel: Dict[str, str]) -> str:
-    """Point <img> tags at extracted local figures; drop unresolved ones."""
+def _rewrite_img_srcs(html: str, key_to_meta: Dict[str, Tuple[str, str]]) -> str:
+    """Replace matched <img> tags with a *clean* ``<img src alt>`` pointing at the
+    extracted figure; drop unresolved ones.
+
+    Confluence adds ``class``/``draggable``/``height`` attributes, and pandoc
+    keeps an attribute-rich ``<img>`` as raw HTML instead of emitting Markdown
+    ``![]()``. Reducing it to ``src`` + ``alt`` makes pandoc produce a proper
+    Markdown image with the document title woven into the alt text.
+    """
 
     def repl(m: "re.Match") -> str:
-        tag = m.group(0)
-        sm = re.search(r'src\s*=\s*["\']?([^"\'> ]+)', tag, re.I)
+        sm = re.search(r'src\s*=\s*["\']?([^"\'> ]+)', m.group(0), re.I)
         if not sm:
             return ""
-        rel = _resolve_img_src(sm.group(1), key_to_rel)
-        if rel is None:
+        meta = _resolve_img_src(sm.group(1), key_to_meta)
+        if meta is None:
             return ""  # filtered icon / unresolved -> remove tag
-        return tag[: sm.start(1)] + rel + tag[sm.end(1):]
+        rel, alt = meta
+        return '<img src="%s" alt="%s" />' % (rel, alt.replace('"', "'"))
 
     return re.sub(r"<img\b[^>]*>", repl, html, flags=re.I)
 
@@ -959,7 +966,7 @@ def convert_word(
     if fmt == "mhtml":
         html, parts = extract_mhtml(src)
         ref_plaintext = _strip_html(html)
-        key_to_rel: Dict[str, str] = {}
+        key_to_meta: Dict[str, Tuple[str, str]] = {}
         n = 0
         if cfg.enabled and cfg.extract_images:
             idx = 0
@@ -973,10 +980,12 @@ def convert_word(
                 fig_dir.mkdir(parents=True, exist_ok=True)
                 fname = "%s-figure%02d.%s" % (slug, idx, ifmt)
                 (fig_dir / fname).write_bytes(data)
-                key_to_rel[key] = "%s/%s" % (rel_base, fname)
+                alt = "%s — figure %d" % (src.stem, idx)
+                key_to_meta[key] = ("%s/%s" % (rel_base, fname), alt)
                 n += 1
-        html = _rewrite_img_srcs(html, key_to_rel)
+        html = _rewrite_img_srcs(html, key_to_meta)
         markdown = html_to_markdown(html, have_pandoc)
+        dest.write_text(markdown, encoding="utf-8")
         return WordConversion(markdown=markdown, images=n, ref_plaintext=ref_plaintext)
 
     if fmt == "docx":
@@ -999,6 +1008,7 @@ def convert_word(
             text=True,
         )
         ref_plaintext = ref.stdout if ref.returncode == 0 else None
+        dest.write_text(markdown, encoding="utf-8")
         return WordConversion(markdown=markdown, images=n, ref_plaintext=ref_plaintext)
 
     raise RuntimeError("unhandled Word format: %s" % fmt)
@@ -1243,6 +1253,12 @@ def validate(
     ``original_plaintext`` is ``None`` for non-PDF inputs (no pdftotext source),
     in which case the similarity check is skipped. ``confidence`` is pdfmux's
     document confidence (PDF only); below ``min_confidence`` fails the document.
+
+    Structural emptiness (a long document with no headings/tables/code/figures)
+    is only a *hard* failure when we have no fidelity signal — if text
+    similarity is high the conversion is demonstrably faithful, so a
+    prose-heavy doc that simply lacks structure is flagged (``structural_ok``)
+    but not failed.
     """
     counts = structural_counts(markdown)
     plain = strip_markdown(markdown)
@@ -1258,7 +1274,9 @@ def validate(
     if confidence is not None:
         conf_ok = confidence >= min_confidence
 
-    passed = struct_ok and (sim_ok is not False) and (conf_ok is not False)
+    # Structural emptiness is fatal only when fidelity is otherwise unverifiable.
+    struct_fatal = (not struct_ok) and (sim_ok is None)
+    passed = (sim_ok is not False) and (conf_ok is not False) and not struct_fatal
 
     return {
         "similarity": similarity,
