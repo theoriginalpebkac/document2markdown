@@ -1,0 +1,24 @@
+# doc2md.py Python dependencies
+#
+# pdfmux: PDF -> Markdown with per-page self-healing extraction + confidence
+#         scoring. The [ocr] extra pulls in RapidOCR so scanned pages don't come
+#         back empty -- recommended for any real-world batch of PDFs.
+#         Requires Python 3.11+.
+pdfmux[ocr]>=1.7.0
+
+# PyMuPDF: used directly by --preview to slice the first N pages of a PDF into a
+# temporary file. It is already a pdfmux dependency, but is listed explicitly
+# because doc2md.py imports it.
+pymupdf>=1.24.0
+
+# --------------------------------------------------------------------------- #
+# System tools (NOT pip-installable) that doc2md.py also needs:
+#
+#   pandoc      -- DOCX/HTML/EPUB/RTF -> Markdown
+#                  macOS:  brew install pandoc
+#                  Debian: sudo apt-get install pandoc
+#
+#   pdftotext   -- from poppler-utils, used for fidelity validation of PDFs
+#                  macOS:  brew install poppler
+#                  Debian: sudo apt-get install poppler-utils
+# --------------------------------------------------------------------------- #
