@@ -1,13 +1,15 @@
 # doc2md
 
-Batch-convert a folder of documents to Markdown with **per-file quality
-validation** and a **summary report**.
+Batch-convert a folder of documents to Markdown with **figure/table extraction**,
+**per-file quality validation**, and a **summary report** — built for producing
+high-fidelity grounding sources from technical design documents.
 
 `doc2md.py` walks an input directory, converts every supported document to
-Markdown, checks each conversion for fidelity and structure, and writes both a
-machine-readable `conversion_report.json` and a human-readable summary to
-stdout. It is built so the conversion and validation helpers can be imported and
-unit-tested independently.
+Markdown, extracts visual content that has no faithful Markdown representation
+to PNG (referenced inline), validates each conversion, and writes both a
+machine-readable `conversion_report.json` and a human-readable stdout summary.
+Conversion, visual-extraction, and validation helpers are independent functions
+so they can be imported and unit-tested on their own.
 
 ---
 
@@ -15,26 +17,93 @@ unit-tested independently.
 
 | Stage | What happens |
 | --- | --- |
-| **Convert** | PDFs go through [pdfmux](https://pypi.org/project/pdfmux/), which routes each page to the best extractor, audits its own output, and re-extracts low-confidence pages. Everything else (DOCX, HTML, EPUB, RTF, ODT) is converted with [pandoc](https://pandoc.org/) to GitHub-Flavored Markdown. Unsupported formats are logged and skipped, never fatal. |
-| **Validate** | For PDFs, raw plain text is pulled from the original with `pdftotext` and compared character-for-character against the Markdown (after Markdown syntax is stripped) using `difflib.SequenceMatcher`. A structural check counts headings, fenced code blocks, and pipe tables and flags documents that are long yet have none. |
-| **Report** | `conversion_report.json` records every file's similarity score, pass/fail verdict, structural counts, pdfmux confidence, and any errors. A summary with totals and a ranked list of the lowest-scoring files is printed to stdout. |
+| **Convert** | PDFs go through [pdfmux](https://pypi.org/project/pdfmux/) (per-page self-healing extraction + confidence scoring). Everything else (DOCX/HTML/EPUB/RTF/ODT) is converted with [pandoc](https://pandoc.org/). Unsupported formats are logged and skipped. Files are processed in parallel (`--workers`, default 4). |
+| **Extract visuals** (PDF) | pdfmux emits no image references, so a PyMuPDF pass renders content that *can't* be represented as Markdown to PNG and references it inline (see below). |
+| **Validate** (PDF) | `pdftotext` raw text vs. the generated Markdown (syntax stripped) via `difflib.SequenceMatcher`; plus a pdfmux-confidence gate and a structural-emptiness check. |
+| **Report** | `conversion_report.json` (per-file score, confidence, structural + figure counts, errors) and a ranked stdout summary. Non-zero exit if any file fails — usable as a CI gate. |
 
-Files are processed in parallel (configurable worker count, default 4). The exit
-code is non-zero if any file errors or fails validation, which makes the tool
-usable as a CI gate.
+### Maximum local effort by default; LLM on demand
+
+The default is the strongest **local** pipeline: pdfmux `quality=standard` (the
+full agentic audit → re-extract loop) with whatever local backends you install
+(OCR, Docling tables). No document is sent to a cloud service by default.
+
+For the occasional document local extraction can't handle, opt in to an LLM:
+
+```bash
+python3 doc2md.py ./docs ./out --llm claude          # or gemini | openai | ollama
+python3 doc2md.py ./docs ./out --llm gemini --llm-budget 0.50
+```
+
+`ollama` keeps it fully local. The report flags which documents have
+low-confidence pages, so you know which ones to re-run with `--llm`.
+
+### Figure & table extraction
+
+The goal is to capture, for grounding, anything that **lacks a faithful Markdown
+representation** — while avoiding image bloat:
+
+| Content | Handling |
+| --- | --- |
+| Information-bearing **raster images** (diagrams/screenshots embedded as images) | **PNG**, referenced inline *(default on)* |
+| **Complex tables** (merged/spanning cells, ragged rows, or unextractable) | **PNG + best-effort Markdown**, co-located *(default on)* |
+| **Simple tables** (incl. multi-line cells) | Markdown only — multi-line cells become `<br>`, no image |
+| Text, headings, lists, code | Markdown only |
+| **Vector diagrams** (drawn as native shapes) | **opt-in** via `--vector-diagrams` *(see caveat)* |
+
+Complex-table blocks put the image reference **immediately before** the
+best-effort Markdown table, with no heading between them, so a structural or
+token-bounded RAG chunker keeps the image and table in the same chunk:
+
+```markdown
+> **[Table — p.7]** Rendered as image (authoritative); best-effort Markdown follows.
+> ![SRO Metrocache Design — page 7, complex table: Cache key fields](sro-metrocache-design/figures/sro-metrocache-design-p007-table01.png)
+
+| field | type | notes |
+| --- | --- | --- |
+| ... | ... | ... |
+```
+
+#### Naming (designed for LLM consumption)
+
+All generated names are **slugified** — lowercase, alphanumeric, hyphen-separated
+— because Markdown image links can't contain unescaped spaces. Output for a
+document `<Doc Name>.pdf` looks like:
+
+```
+<output>/<doc-slug>.md
+<output>/<doc-slug>/figures/<doc-slug>-p<PPP>-<kind><NN>.png
+```
+
+- `<doc-slug>` e.g. `sro-metrocache-design`; the slug prefixes every PNG so files
+  stay unique and traceable even if relocated by a RAG pipeline.
+- `p<PPP>` = 1-based page number (zero-padded); `<kind>` = `figure` / `table` /
+  `diagram`; `<NN>` = per-page index.
+- **Alt text** carries the semantics LLMs actually read: original document title,
+  page number, kind, and any nearby caption — so a decontextualized chunk still
+  identifies the source.
+
+#### Caveat on `--vector-diagrams`
+
+Auto-detecting vector diagrams is **off by default and best-effort**. In PDFs
+exported from Google Docs / Confluence, tables, tables-of-contents, colored
+letter-badges and highlight bars are all drawn as vector rectangles and are not
+reliably distinguishable from real diagrams by geometry — an always-on detector
+ends up imaging text and TOC pages. Diagrams embedded as **raster images** are
+captured by the default image pass; diagram **text labels** are always captured
+by pdfmux. Enable `--vector-diagrams` only for genuinely diagram-centric PDFs,
+and review the output.
 
 ---
 
 ## Requirements
 
-### Python package dependencies (`requirements.txt`)
+### Python packages (`requirements.txt`)
 
 | Dependency | Used for |
 | --- | --- |
-| **pdfmux[ocr]** (>=1.7.0) | Primary PDF → Markdown converter. Per-page self-healing extraction with confidence scoring; the `[ocr]` extra adds RapidOCR so scanned pages don't come back empty. **Requires Python 3.11+.** |
-| **pymupdf** (>=1.24.0) | Used directly by `--preview` to slice the first *N* pages of a PDF into a temporary file so the full pdfmux pipeline runs on a smaller document. (Already a pdfmux dependency; listed because `doc2md.py` imports it.) |
-
-Install with:
+| **pdfmux[ocr,tables]** (>=1.7.0) | Primary PDF → Markdown converter (self-healing extraction). The `[ocr]`/`[tables]` extras add local backends (scanned pages, high-fidelity tables) that the router uses for the default "max local effort". **Requires Python 3.11+.** |
+| **pymupdf** (>=1.24.0) | Figure/table rendering to PNG and `--preview` page slicing. |
 
 ```bash
 pip install -r requirements.txt
@@ -44,61 +113,69 @@ pip install -r requirements.txt
 
 | Tool | Used for | Install |
 | --- | --- | --- |
-| **pandoc** | Converts DOCX / HTML / EPUB / RTF / ODT to Markdown. | macOS: `brew install pandoc` · Debian/Ubuntu: `sudo apt-get install pandoc` · [other](https://pandoc.org/installing.html) |
-| **pdftotext** (from poppler-utils) | Extracts raw plain text from the original PDF for the fidelity comparison. Without it, PDFs still convert but get no similarity score. | macOS: `brew install poppler` · Debian/Ubuntu: `sudo apt-get install poppler-utils` |
+| **pandoc** | DOCX / HTML / EPUB / RTF / ODT → Markdown | macOS: `brew install pandoc` · Debian: `sudo apt-get install pandoc` |
+| **pdftotext** (poppler-utils) | Raw text for the fidelity comparison. Without it PDFs still convert but get no similarity score. | macOS: `brew install poppler` · Debian: `sudo apt-get install poppler-utils` |
 
-`doc2md.py` checks for all three on startup and prints actionable install
-instructions for anything missing rather than failing silently. Missing tools
-degrade gracefully: the relevant files are recorded as errors and the batch
-continues.
+`doc2md.py` checks for all of these on startup and prints install instructions
+for anything missing rather than failing silently; missing tools degrade
+gracefully (affected files are recorded as errors, the batch continues).
 
-> **Python version note:** pdfmux requires Python **3.11+**. `doc2md.py` itself
-> is written to parse and run on 3.9+, but the PDF path needs a 3.11+
-> interpreter with pdfmux installed.
+> **Python version:** pdfmux requires Python **3.11+**. The PDF path needs a
+> 3.11+ interpreter with pdfmux installed; doc2md's own logic runs on 3.9+.
 
 ---
 
 ## Usage
 
 ```bash
-python3 doc2md.py INPUT_DIR OUTPUT_DIR [options]
+python3 doc2md.py INPUT_PATH [OUTPUT_DIR] [options]
 ```
+
+`INPUT_PATH` is a **single document or a directory**. `OUTPUT_DIR` is optional —
+when omitted it defaults to a **`markdown/` folder at the documents' path**
+(inside the input directory, or next to a single input file). That nested
+`markdown/` folder is automatically excluded from scanning, so re-runs don't
+reprocess generated output.
 
 | Option | Default | Description |
 | --- | --- | --- |
 | `-w`, `--workers N` | `4` | Parallel worker count. |
-| `-t`, `--threshold R` | `0.85` | Minimum similarity ratio to pass validation. |
-| `-q`, `--quality {fast,standard,high}` | `standard` | pdfmux extraction quality. |
-| `--preview` | off | Quick sanity check: process only the first few pages of each PDF. |
-| `--preview-pages N` | `3` | Number of pages to use with `--preview`. |
+| `-t`, `--threshold R` | `0.90` | Minimum text-similarity ratio to pass validation. |
+| `--min-confidence R` | `0.70` | Minimum pdfmux confidence to pass. |
+| `-q`, `--quality {fast,standard,high}` | `standard` | Local extraction quality; `standard` is the max local effort. |
+| `--llm {gemini,claude,openai,ollama}` | off | Enable LLM fallback for hard documents. |
+| `--llm-budget USD` | — | Per-document spend cap when `--llm` is set. |
+| `--no-figures` | off | Text-only Markdown (disable all image extraction). |
+| `--vector-diagrams` | off | Best-effort vector-diagram extraction (see caveat). |
+| `--figure-dpi N` | `150` | Render DPI for extracted PNGs. |
+| `--preview` | off | Process only the first few pages of each PDF (quick sanity check). |
+| `--preview-pages N` | `3` | Pages to use with `--preview`. |
 
 ### Examples
 
 ```bash
-# Convert everything under ./docs into ./out
+# Folder in, output defaults to ./docs/markdown/
+python3 doc2md.py ./docs
+
+# Single file in, output defaults to its folder's markdown/
+python3 doc2md.py "./docs/SRO Metrocache Design.pdf"
+
+# Explicit output directory
 python3 doc2md.py ./docs ./out
 
-# Fast sanity check on the first 3 pages of each PDF, 8 workers
-python3 doc2md.py ./docs ./out --preview --workers 8
+# Quick sanity check on the first 3 pages
+python3 doc2md.py ./docs --preview
 
-# Stricter fidelity bar, high-quality extraction
-python3 doc2md.py ./docs ./out --threshold 0.92 --quality high
+# Diagram-centric corpus, higher-res figures
+python3 doc2md.py ./docs --vector-diagrams --figure-dpi 200
+
+# Re-run a problem document through an LLM with a budget cap
+python3 doc2md.py "./docs/hard.pdf" --llm claude --llm-budget 0.50
 ```
 
-The input tree's structure is mirrored under the output directory, with each
-file rewritten to `.md` (e.g. `docs/sub/report.pdf` → `out/sub/report.md`).
-
----
-
-## A note on `--preview`
-
-pdfmux's public API (`extract_text`, `pipeline.process`, and the `pdfmux
-convert` CLI) does **not** expose a page-range option — only an internal
-extractor does, and using it would bypass the router/audit pipeline that is the
-whole reason for choosing pdfmux. So `--preview` slices the first *N* pages into
-a temporary PDF with PyMuPDF and runs the full self-healing pipeline on that
-slice. `pdftotext` is given a matching `-l N` so the fidelity comparison stays
-like-for-like.
+The input tree's structure is mirrored under the output directory; each file is
+rewritten to a slugified `.md`, with figures in a sibling `<doc-slug>/figures/`
+folder.
 
 ---
 
@@ -109,28 +186,19 @@ like-for-like.
 ```jsonc
 {
   "summary": {
-    "total_files": 12,
-    "converted": 10,
-    "skipped": 1,
-    "errors": 1,
-    "passed": 9,
-    "failed_validation": 1
+    "total_files": 23, "converted": 21, "skipped": 2, "errors": 0,
+    "passed": 20, "failed_validation": 1, "figures_extracted": 47
   },
   "files": [
     {
-      "filename": "report.pdf",
-      "source_path": "docs/report.pdf",
-      "converter": "pdfmux",
-      "status": "converted",
-      "output_path": "out/report.md",
-      "similarity": 0.94,
-      "pdfmux_confidence": 0.97,
-      "structural": { "headings": 8, "code_blocks": 0, "tables": 3 },
-      "structural_ok": true,
-      "structural_reason": null,
-      "passed": true,
-      "preview": false,
-      "error": null
+      "filename": "SRO Metrocache Design.pdf",
+      "converter": "pdfmux", "status": "converted",
+      "output_path": "docs/markdown/sro-metrocache-design.md",
+      "similarity": 0.94, "pdfmux_confidence": 0.97, "min_page_confidence": 0.88,
+      "structural": { "headings": 31, "code_blocks": 4, "tables": 12, "images": 10 },
+      "figures": { "diagrams": 0, "images": 10, "complex_tables": 0 },
+      "similarity_ok": true, "confidence_ok": true, "structural_ok": true,
+      "passed": true, "preview": false, "used_llm": false, "error": null
     }
   ]
 }
@@ -138,9 +206,9 @@ like-for-like.
 
 ### stdout summary
 
-Totals (converted / passed / failed / skipped / errored), a ranked list of the
-lowest-scoring files, any structurally suspicious documents, and per-file
-errors.
+Totals (converted / passed / failed / skipped / errored), figures extracted, a
+ranked list of the lowest-scoring files with confidence, and per-file failure
+reasons.
 
 ---
 
@@ -148,6 +216,7 @@ errors.
 
 | File | Purpose |
 | --- | --- |
-| `doc2md.py` | The CLI tool and all conversion/validation helpers. |
-| `requirements.txt` | Python dependencies (see above). |
+| `doc2md.py` | CLI tool + conversion / visual-extraction / validation helpers. |
+| `requirements.txt` | Python dependencies. |
+| `SECURITY.md` | How to report vulnerabilities. |
 | `README.md` | This file. |

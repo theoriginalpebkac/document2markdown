@@ -1,14 +1,20 @@
 # doc2md.py Python dependencies
 #
 # pdfmux: PDF -> Markdown with per-page self-healing extraction + confidence
-#         scoring. The [ocr] extra pulls in RapidOCR so scanned pages don't come
-#         back empty -- recommended for any real-world batch of PDFs.
-#         Requires Python 3.11+.
-pdfmux[ocr]>=1.7.0
+#         scoring. Requires Python 3.11+.
+#
+#         The extras below give the local router more backends to choose from,
+#         which is the "maximum local effort" doc2md uses by default (no cloud
+#         LLM unless you pass --llm):
+#           [ocr]    RapidOCR for the occasional scanned page
+#           [tables] Docling for high-fidelity table extraction
+#         Add [marker]/[opendataloader] too if your corpus has academic papers
+#         or very complex multi-column layouts; or use pdfmux[all] for everything.
+pdfmux[ocr,tables]>=1.7.0
 
-# PyMuPDF: used directly by --preview to slice the first N pages of a PDF into a
-# temporary file. It is already a pdfmux dependency, but is listed explicitly
-# because doc2md.py imports it.
+# PyMuPDF: drives the figure/table extraction pass (rendering raster images and
+# complex tables to PNG) and --preview page slicing. Also a pdfmux dependency,
+# listed explicitly because doc2md.py imports it directly.
 pymupdf>=1.24.0
 
 # --------------------------------------------------------------------------- #
