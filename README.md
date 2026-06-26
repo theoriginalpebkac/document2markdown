@@ -63,10 +63,11 @@ export of a given document:
   path captures those.
 - **Google Docs** — download as **`.docx`** (structure + images preserved). Avoid
   the Markdown download: it drops images. (Zipped HTML is a fine alternative.)
-- **Akamai config XML** — feed the **XML directly**; don't pre-convert it to PDF.
-  doc2md keeps syntax-critical config verbatim, so exact tags/attributes/values
-  survive (which a PDF round-trip would mangle). The Markdown output is suitable
-  for tools like NotebookLM without the lossy PDF step.
+- **Configuration XML** (where syntax details must be preserved) — feed the
+  **XML directly**; don't pre-convert it to PDF. doc2md keeps syntax-critical
+  config verbatim, so exact tags/attributes/values survive (which a PDF
+  round-trip would mangle). The Markdown output is suitable for downstream LLM
+  tools without the lossy PDF step.
 
 ### Figure & table extraction
 
