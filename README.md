@@ -133,7 +133,7 @@ and review the output.
 
 | Dependency | Used for |
 | --- | --- |
-| **pdfmux[ocr,tables]** (>=1.7.0) | Primary PDF → Markdown converter (self-healing extraction). The `[ocr]`/`[tables]` extras add local backends (scanned pages, high-fidelity tables) that the router uses for the default "max local effort". **Requires Python 3.11+.** |
+| **pdfmux[ocr,tables]** (>=1.7.0) | Primary PDF → Markdown converter (self-healing extraction). The `[ocr]`/`[tables]` extras add local backends (scanned pages, high-fidelity tables) that the router uses for the default "max local effort". |
 | **pymupdf** (>=1.24.0) | Figure/table rendering to PNG and `--preview` page slicing. |
 
 ```bash
@@ -150,9 +150,6 @@ pip install -r requirements.txt
 `doc2md.py` checks for all of these on startup and prints install instructions
 for anything missing rather than failing silently; missing tools degrade
 gracefully (affected files are recorded as errors, the batch continues).
-
-> **Python version:** pdfmux requires Python **3.11+**. The PDF path needs a
-> 3.11+ interpreter with pdfmux installed; doc2md's own logic runs on 3.9+.
 
 ---
 
