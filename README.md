@@ -1,8 +1,21 @@
 # doc2md
 
-Batch-convert a folder of documents to Markdown with **figure/table extraction**,
-**per-file quality validation**, and a **summary report** — built for producing
-high-fidelity grounding sources from technical design documents.
+> Convert document batches into Markdown trustworthy enough to ground an LLM — verified, not just converted.
+
+**doc2md** turns folders of documents — PDFs, Word and Confluence exports,
+configuration XML, and more — into Markdown built to serve as **grounding
+sources for AI/LLM applications and RAG pipelines**, where a silently garbled
+conversion is worse than none at all. Unlike general-purpose document-to-Markdown
+converters that optimize for breadth and one-shot convenience, doc2md is
+**fidelity-first**: every file is independently validated — its text
+cross-checked against a separate extraction engine, scored, and flagged in a
+pass/fail report — and anything Markdown can't faithfully represent, such as
+diagrams and complex tables, is extracted to images and referenced inline rather
+than dropped. Those references are kept adjacent to their surrounding context so
+retrieval chunks stay intact, and the pipeline pairs self-healing,
+confidence-scored PDF extraction with content-aware routing per source type —
+deliberately trading breadth for the verifiable accuracy that technical and
+architecture work demands.
 
 `doc2md.py` walks an input directory, converts every supported document to
 Markdown, extracts visual content that has no faithful Markdown representation
