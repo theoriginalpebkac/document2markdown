@@ -65,6 +65,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -220,6 +221,10 @@ class FileRecord:
     passed: Optional[bool] = None
     preview: bool = False
     used_llm: bool = False
+    # Choices doc2md made automatically (e.g. "auto" OCR / xml-mode), each with
+    # the value chosen, why, and the flag to override it. Surfaced on stdout and
+    # in conversion_report.json so an auto decision is never silent.
+    auto_decisions: List[Dict[str, str]] = field(default_factory=list)
     error: Optional[str] = None
 
 
@@ -685,6 +690,171 @@ def _slice_pdf_pages(src: Path, n_pages: int, dest_dir: Path) -> Path:
     finally:
         doc.close()
     return dest
+
+
+# --------------------------------------------------------------------------- #
+# Docling OCR policy
+# --------------------------------------------------------------------------- #
+#
+# pdfmux routes table-bearing PDFs to Docling, which builds a bare
+# ``DocumentConverter()`` — and Docling defaults to running full-page OCR
+# (Tesseract) on *every* page on top of its TableFormer structure model. On a
+# born-digital PDF the text layer is already authoritative, so that OCR pass is
+# pure wasted time (and the source of the "Image too small to scale" / "Line
+# cannot be recognized" noise) without improving fidelity: TableFormer reads
+# cell text from the text layer, not from OCR. On a hundreds-of-pages,
+# table-dense document this is the difference between minutes and a run that
+# never finishes.
+#
+# So we disable Docling's OCR for PDFs that are clearly text-based, while
+# leaving it ON for scanned / image PDFs that genuinely need it. The decision
+# is made per file from the path passed to each Docling ``convert()`` call, so
+# it stays correct under both pdfmux's internal worker thread and doc2md's own
+# ThreadPoolExecutor — there is no shared mutable selection state to race on.
+
+# A PDF is treated as text-based when at least this share of its non-empty
+# sampled pages carry a real text layer (mirrors pdfmux's own 0.80 digital
+# ratio). Conservative by design: when unsure, leave OCR on.
+DOCLING_TEXT_BASED_RATIO = 0.80
+_DOCLING_TEXT_SAMPLE_PAGES = 30
+
+# How to override the auto OCR decision, shown to the user with every report.
+_OCR_OVERRIDE_HINT = "--ocr on (force OCR) | --ocr off (force skip)"
+
+
+def _ocr_decision(src: Path, mode: str) -> Dict[str, str]:
+    """Resolve the Docling OCR decision for one PDF into a reportable record.
+
+    Single source of truth shared by the report/stdout path and the converter
+    wrapper, so what we tell the user always matches what actually runs. For
+    ``mode="auto"`` it classifies the PDF (see :func:`_pdf_is_text_based`);
+    ``"on"``/``"off"`` are forced. Returns a dict with ``setting``, ``choice``
+    ("on"/"off"), a human ``reason``, and the ``override`` hint.
+    """
+    if mode == "on":
+        choice, reason = "on", "forced on (--ocr on)"
+    elif mode == "off":
+        choice, reason = "off", "forced off (--ocr off)"
+    elif _pdf_is_text_based(src):
+        choice = "off"
+        reason = "auto: born-digital PDF, text layer authoritative — OCR skipped"
+    else:
+        choice = "on"
+        reason = "auto: scanned/image PDF — OCR needed"
+    return {
+        "setting": "ocr",
+        "choice": choice,
+        "reason": reason,
+        "override": _OCR_OVERRIDE_HINT,
+    }
+
+
+def _pdf_is_text_based(path: Path) -> bool:
+    """True if *path* is a born-digital PDF whose text layer makes OCR redundant.
+
+    Samples up to ``_DOCLING_TEXT_SAMPLE_PAGES`` pages spread across the
+    document and counts those carrying a real text layer (>50 chars — the same
+    bar pdfmux uses). Returns True only when the text-bearing share of non-empty
+    pages clears :data:`DOCLING_TEXT_BASED_RATIO`, so scanned/image PDFs keep
+    OCR. On any error (or without PyMuPDF) it returns ``False`` — i.e. it leaves
+    OCR enabled rather than risk dropping it on a doc that needs it.
+    """
+    if pymupdf is None:
+        return False
+    try:
+        doc = pymupdf.open(str(path))
+    except Exception:
+        return False
+    try:
+        total = doc.page_count
+        if total == 0:
+            return False
+        if total <= _DOCLING_TEXT_SAMPLE_PAGES:
+            sample = range(total)
+        else:
+            step = total / _DOCLING_TEXT_SAMPLE_PAGES
+            sample = sorted({int(i * step) for i in range(_DOCLING_TEXT_SAMPLE_PAGES)})
+        text_pages = 0
+        non_empty = 0
+        for pn in sample:
+            page = doc[pn]
+            text_len = len(page.get_text("text").strip())
+            has_images = bool(page.get_images(full=True))
+            if text_len < 20 and not has_images:
+                continue  # empty page — excluded from the ratio (matches pdfmux)
+            non_empty += 1
+            if text_len > 50:
+                text_pages += 1
+        if non_empty == 0:
+            return False
+        return (text_pages / non_empty) >= DOCLING_TEXT_BASED_RATIO
+    finally:
+        doc.close()
+
+
+def install_docling_ocr_policy(mode: str) -> None:
+    """Control Docling's OCR for PDF table extraction inside pdfmux.
+
+    ``mode``:
+        * ``"on"``  — no-op; Docling keeps its default (OCR on every page).
+        * ``"off"`` — Docling OCR is disabled for every PDF.
+        * ``"auto"`` — Docling OCR is disabled for born-digital PDFs (see
+          :func:`_pdf_is_text_based`) and left on for scanned/image PDFs.
+
+    Implemented by replacing pdfmux's ``_get_converter`` with a stand-in whose
+    ``convert()`` picks an OCR-on or OCR-off Docling converter per source PDF.
+    Both real converters are built once and cached, so the only per-call work is
+    the (cheap, sampled) text-layer check. Never raises and never breaks the
+    pipeline: if pdfmux/Docling aren't importable in a shape we recognize, it
+    logs and leaves Docling's default in place.
+    """
+    if mode == "on":
+        return
+    try:
+        from pdfmux.extractors import tables as _tables
+        from docling.datamodel.base_models import InputFormat
+        from docling.datamodel.pipeline_options import PdfPipelineOptions
+        from docling.document_converter import DocumentConverter, PdfFormatOption
+    except Exception as exc:  # pragma: no cover - depends on optional deps
+        print(
+            "[info] OCR policy not applied (%s); Docling keeps its default" % exc,
+            file=sys.stderr,
+        )
+        return
+
+    cache: Dict[bool, object] = {}
+    lock = threading.Lock()
+
+    def _converter_for(do_ocr: bool):
+        with lock:
+            conv = cache.get(do_ocr)
+            if conv is None:
+                opts = PdfPipelineOptions()
+                opts.do_ocr = do_ocr
+                opts.do_table_structure = True
+                conv = DocumentConverter(
+                    format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=opts)}
+                )
+                cache[do_ocr] = conv
+            return conv
+
+    class _OcrPolicyConverter:
+        """Drop-in for Docling's DocumentConverter that selects an OCR-on or
+        OCR-off real converter based on the source PDF handed to ``convert``."""
+
+        def convert(self, source, *args, **kwargs):
+            # Decide per source PDF (the report path logs the decision; here we
+            # only act on it). Errs toward keeping OCR if classification fails.
+            try:
+                do_ocr = _ocr_decision(Path(str(source)), mode)["choice"] == "on"
+            except Exception:
+                do_ocr = True
+            return _converter_for(do_ocr).convert(source, *args, **kwargs)
+
+    _singleton = _OcrPolicyConverter()
+    _tables._get_converter = lambda: _singleton
+    # Some pdfmux versions read the cached singleton directly; keep it coherent.
+    _tables._converter_instance = _singleton
 
 
 def _extract_pdf_pages(src: Path, quality: str) -> Tuple[List[Tuple[int, str]], Optional[float], Optional[float]]:
@@ -1617,6 +1787,27 @@ def _output_path_for(src: Path, input_root: Path, output_dir: Path) -> Path:
     return output_dir / rel.parent / (slugify(rel.stem) + ".md")
 
 
+def _note_auto_decision(record: FileRecord, decision: Dict[str, str]) -> None:
+    """Record an auto-made choice on ``record`` and echo it with its override.
+
+    Keeps stdout and ``conversion_report.json`` in lockstep: every entry added
+    to ``record.auto_decisions`` is also printed, so an automatic decision is
+    visible both interactively and in the machine-readable report.
+    """
+    record.auto_decisions.append(decision)
+    print(
+        "[auto] %s: %s = %s — %s (override: %s)"
+        % (
+            record.filename,
+            decision["setting"],
+            decision["choice"],
+            decision["reason"],
+            decision["override"],
+        ),
+        file=sys.stderr,
+    )
+
+
 def process_file(
     src: Path,
     input_root: Path,
@@ -1629,6 +1820,7 @@ def process_file(
     preview_pages: Optional[int] = None,
     visual_cfg: Optional[VisualConfig] = None,
     xml_mode: str = "auto",
+    ocr_mode: str = "auto",
     used_llm: bool = False,
 ) -> FileRecord:
     """Convert + validate a single file. Never raises — errors go in the record.
@@ -1667,6 +1859,10 @@ def process_file(
             if not deps.get("pdfmux"):
                 raise RuntimeError("pdfmux is not installed; cannot convert PDFs")
             record.converter = "pdfmux"
+            # Only Docling (standard quality) consults the OCR policy; the LLM
+            # path (quality="high") doesn't, so don't claim a decision there.
+            if quality != "high":
+                _note_auto_decision(record, _ocr_decision(src, ocr_mode))
             conv = convert_pdf(
                 src, dest, quality=quality, preview_pages=preview_pages, visual_cfg=visual_cfg
             )
@@ -1688,6 +1884,13 @@ def process_file(
         elif fmt == "xml":
             markdown, mode_used, dest = convert_xml(src, dest, mode=xml_mode)
             record.converter = "xml-%s" % mode_used
+            if xml_mode == "auto":
+                _note_auto_decision(record, {
+                    "setting": "xml-mode",
+                    "choice": mode_used,
+                    "reason": "auto: chosen by content sniffing",
+                    "override": "--xml-mode verbatim|transform|yaml (or --yaml)",
+                })
             output_format = "yaml" if mode_used == "yaml" else "markdown"
             if output_format == "yaml":
                 source_xml = src.read_text(encoding="utf-8", errors="replace")
@@ -1862,6 +2065,7 @@ def run_batch(
     preview_pages: Optional[int] = None,
     visual_cfg: Optional[VisualConfig] = None,
     xml_mode: str = "auto",
+    ocr_mode: str = "auto",
     used_llm: bool = False,
     deps: Optional[Dict[str, bool]] = None,
 ) -> List[FileRecord]:
@@ -1901,6 +2105,7 @@ def run_batch(
                 preview_pages=preview_pages,
                 visual_cfg=visual_cfg,
                 xml_mode=xml_mode,
+                ocr_mode=ocr_mode,
                 used_llm=used_llm,
             ): f
             for f in files
@@ -1945,6 +2150,14 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "-q", "--quality", choices=("fast", "standard", "high"), default="standard",
         help="pdfmux local extraction quality; 'standard' is the max local effort "
         "(default). 'high' implies cloud LLM — prefer --llm for that.",
+    )
+    parser.add_argument(
+        "--ocr", choices=("auto", "on", "off"), default="auto",
+        help="Docling OCR control for PDF table extraction. 'auto' (default) "
+        "disables OCR on born-digital PDFs — much faster, no fidelity loss since "
+        "the text layer is authoritative — and keeps it on for scanned/image "
+        "PDFs. 'on' forces OCR on every page (pdfmux's stock behavior); 'off' "
+        "disables it for all PDFs.",
     )
     parser.add_argument(
         "--llm", metavar="PROVIDER", choices=("gemini", "claude", "openai", "ollama"),
@@ -2034,6 +2247,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         used_llm = True
         print("[info] LLM fallback enabled via provider '%s' (mode=premium)" % args.llm)
 
+    # Decide Docling's OCR behavior before any PDF is processed. Skips wasted
+    # full-page OCR on born-digital PDFs (the common slow/erroring case) while
+    # leaving it on for scanned docs. No-op when pdfmux is absent or --ocr=on.
+    if deps.get("pdfmux") and args.ocr != "on":
+        install_docling_ocr_policy(args.ocr)
+
     visual_cfg = VisualConfig(
         enabled=not args.no_figures,
         dpi=args.figure_dpi,
@@ -2051,6 +2270,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         preview_pages=preview_pages,
         visual_cfg=visual_cfg,
         xml_mode=xml_mode,
+        ocr_mode=args.ocr,
         used_llm=used_llm,
         deps=deps,
     )
