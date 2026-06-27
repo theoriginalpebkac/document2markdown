@@ -87,10 +87,13 @@ export of a given document:
     fenced-XML Markdown but **without the closing-tag and angle-bracket
     overhead, so it consumes markedly fewer tokens** — the reason this mode
     exists. Every file is verified to round-trip back to the source XML, so the
-    saving costs no fidelity (the only things dropped are XML comments and
-    processing instructions). Best for config-style XML; documentation-style XML
-    (prose with mid-sentence inline tags) reads better as Markdown — leave
-    `--yaml` off for those.
+    saving costs no fidelity. **XML comments are preserved and positioned** — a
+    comment is kept as a `_comment` entry inside the block it sits above (config
+    comments often carry the *why*, e.g. a Jira reference, for the logic beneath
+    them), so the annotation stays with its block; only processing instructions
+    and the DOCTYPE are dropped. Best for config-style XML;
+    documentation-style XML (prose with mid-sentence inline tags) reads better as
+    Markdown — leave `--yaml` off for those.
 
 ### Figure & table extraction
 

@@ -1152,6 +1152,100 @@ def xml_to_markdown_transform(path: Path, raw: str) -> str:
     return "\n".join(lines)
 
 
+# Tokenizes XML into comments / CDATA / DOCTYPE / PI / end / start-or-selfclose.
+# Start/self-close alternative is quote-aware so a ``>`` inside an attribute value
+# (legal in XML) doesn't end the tag early.
+_XML_TOKEN_RE = re.compile(
+    r"<!--.*?-->"
+    r"|<!\[CDATA\[.*?\]\]>"
+    r"|<!DOCTYPE(?:[^<>\"']|\"[^\"]*\"|'[^']*')*>"
+    r"|<\?.*?\?>"
+    r"|</[^>]*>"
+    r"|<(?:[^<>\"']|\"[^\"]*\"|'[^']*')*>",
+    re.S,
+)
+
+
+def _xml_comments_to_elements(raw: str, tag: str = "_comment") -> str:
+    """Rewrite XML comments as ``<_comment>`` child elements of the block they
+    annotate, so a comment survives ``xmltodict``'s by-key grouping *and* keeps
+    its position.
+
+    A comment is moved inside the element that immediately follows it (the block
+    it describes); a self-closing target is expanded so the comment can live
+    inside it; a comment sitting just before a closing tag stays in place as the
+    last child of the enclosing element (e.g. an ``END`` marker). Consecutive
+    comments attach as a list to the same block. Comments inside CDATA are left
+    untouched. Text is XML-escaped, and newlines are preserved (element content,
+    unlike an attribute, is not whitespace-normalized).
+
+    This is a surgical string transform — every non-comment byte is preserved, so
+    namespace prefixes and formatting are untouched.
+    """
+    def esc(t: str) -> str:
+        return t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    def cel(text: str) -> str:
+        return "<%s>%s</%s>" % (tag, esc(text.strip()), tag)
+
+    toks: List[List[str]] = []
+    pos = 0
+    for m in _XML_TOKEN_RE.finditer(raw):
+        t = m.group(0)
+        gap = raw[pos:m.start()]
+        pos = m.end()
+        if t.startswith("<!--"):
+            kind = "comment"
+        elif t.startswith("</"):
+            kind = "end"
+        elif t.endswith("/>"):
+            kind = "selfclose"
+        elif t.startswith("<!") or t.startswith("<?"):
+            kind = "other"
+        else:
+            kind = "start"
+        toks.append([kind, t, gap])
+    trailing = raw[pos:]
+
+    out: List[str] = []
+    i, n = 0, len(toks)
+    while i < n:
+        kind, tok, gap = toks[i]
+        if kind != "comment":
+            out.append(gap)
+            out.append(tok)
+            i += 1
+            continue
+        out.append(gap)
+        # collect a run of consecutive comments (only whitespace between them)
+        comments: List[str] = []
+        j = i
+        while j < n and toks[j][0] == "comment" and (j == i or toks[j][2].strip() == ""):
+            comments.append(re.match(r"<!--(.*)-->$", toks[j][1], re.S).group(1))
+            j += 1
+        nxt = toks[j] if j < n else None
+        if nxt and nxt[0] == "start" and nxt[2].strip() == "":
+            out.append(nxt[2])  # indentation before the start tag
+            out.append(nxt[1])
+            out.extend(cel(c) for c in comments)
+            i = j + 1
+        elif nxt and nxt[0] == "selfclose" and nxt[2].strip() == "":
+            name = re.match(r"<\s*([A-Za-z_][\w.\-:]*)", nxt[1]).group(1)
+            out.append(nxt[2])
+            out.append(nxt[1][:-2].rstrip() + ">")  # <x .../> -> <x ...>
+            out.extend(cel(c) for c in comments)
+            out.append("</%s>" % name)
+            i = j + 1
+        else:  # trailing comment (before a close tag / EOF): keep in place
+            for off, c in enumerate(comments):
+                if off > 0:
+                    out.append(toks[i + off][2])
+                out.append(cel(c))
+            i = j
+    out.append(trailing)
+    return "".join(out)
+
+
 def xml_to_yaml(raw: str) -> str:
     """Convert XML to YAML (structure-preserving, low-token, no Markdown wrapper).
 
@@ -1160,8 +1254,13 @@ def xml_to_yaml(raw: str) -> str:
     document order preserved. Intended for configuration XML headed for LLM/RAG
     ingestion (e.g. NotebookLM, which won't parse XML fenced inside Markdown).
 
-    Lossy for XML comments and processing instructions, and awkward for mixed
-    prose+inline-tag content, so it is *not* used for documentation-style XML.
+    XML comments are preserved and *positioned* — important in config XML, where a
+    comment often carries the *why* (e.g. a Jira reference) for the block beneath
+    it. :func:`_xml_comments_to_elements` rewrites each comment into a ``_comment``
+    child of the block it annotates before parsing, so it stays attached through
+    ``xmltodict``'s by-key grouping. Processing instructions and the DOCTYPE are
+    still dropped. Mixed prose+inline-tag content is awkward, so this is *not* used
+    for documentation-style XML.
 
     Raises ``RuntimeError`` if the optional ``xmltodict``/``PyYAML`` packages are
     not installed; propagates ``expat.ExpatError`` on malformed XML so callers can
@@ -1175,8 +1274,26 @@ def xml_to_yaml(raw: str) -> str:
             "--yaml needs the 'xmltodict' and 'PyYAML' packages; "
             "install them with:  pip install -r requirements.txt"
         ) from exc
-    parsed = xmltodict.parse(raw)
-    return yaml.dump(parsed, default_flow_style=False, sort_keys=False, allow_unicode=True)
+
+    # Render multiline strings (large comment blocks, multiline text) as literal
+    # block scalars (``|``) instead of escaped double-quoted blobs — far more
+    # readable and lower-token. PyYAML falls back to a quoted style on its own for
+    # strings a literal block can't represent (e.g. trailing whitespace), so this
+    # never breaks round-tripping. Single-line scalars are untouched.
+    class _BlockDumper(yaml.Dumper):
+        pass
+
+    def _str_rep(dumper, value):
+        style = "|" if "\n" in value else None
+        return dumper.represent_scalar("tag:yaml.org,2002:str", value, style=style)
+
+    _BlockDumper.add_representer(str, _str_rep)
+
+    parsed = xmltodict.parse(_xml_comments_to_elements(raw))
+    return yaml.dump(
+        parsed, Dumper=_BlockDumper, default_flow_style=False, sort_keys=False,
+        allow_unicode=True,
+    )
 
 
 def convert_xml(src: Path, dest: Path, mode: str = "auto") -> Tuple[str, str, Path]:
@@ -1337,10 +1454,14 @@ def yaml_fidelity_check(
     """Verify ``--yaml`` output reproduces the source XML's structure exactly.
 
     Re-parses the emitted YAML and compares it to ``xmltodict``'s parse of the
-    source XML. Because the conversion is ``yaml.dump(xmltodict.parse(xml))``, a
-    faithful run must satisfy ``safe_load(yaml) == xmltodict.parse(xml)``; any
-    mismatch means a bad parse/serialization path (e.g. a scalar that YAML
-    re-reads as a bool/null), which this fails on rather than shipping silently.
+    source XML. Because the conversion is
+    ``yaml.dump(xmltodict.parse(_xml_comments_to_elements(xml)))``, a faithful run
+    must satisfy ``safe_load(yaml) == xmltodict.parse(_xml_comments_to_elements(xml))``;
+    any mismatch means a bad parse/serialization path (e.g. a scalar that YAML
+    re-reads as a bool/null, or a dropped/misplaced comment), which this fails on
+    rather than shipping silently. The comment preprocessing mirrors
+    :func:`xml_to_yaml` so the comparison verifies the positioned ``_comment``
+    nodes too.
 
     Returns ``(None, None)`` when no source is available (fidelity unassessable).
     """
@@ -1350,7 +1471,7 @@ def yaml_fidelity_check(
         import xmltodict
         import yaml
 
-        expected = xmltodict.parse(source_xml)
+        expected = xmltodict.parse(_xml_comments_to_elements(source_xml))
         actual = yaml.safe_load(yaml_content)
     except Exception as exc:  # noqa: BLE001 - any failure means we can't vouch for it
         return False, "could not verify YAML fidelity: %s" % exc
