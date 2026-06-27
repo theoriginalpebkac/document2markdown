@@ -17,6 +17,13 @@ pdfmux[ocr,tables]>=1.7.0
 # listed explicitly because doc2md.py imports it directly.
 pymupdf>=1.24.0
 
+# Optional, only needed for --yaml (XML -> YAML output). Imported lazily, so
+# users who never pass --yaml don't need these installed.
+#   xmltodict: XML -> dict (attributes -> @name, text -> #text, repeats -> list)
+#   PyYAML:    dict -> YAML
+xmltodict>=0.13.0
+PyYAML>=6.0
+
 # --------------------------------------------------------------------------- #
 # System tools (NOT pip-installable) that doc2md.py also needs:
 #

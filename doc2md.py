@@ -8,6 +8,7 @@ Conversion (handler chosen by content sniffing, not extension)
     * Confluence "Word" export  -> MHTML: extract HTML + base64 images -> pandoc
     * config XML                -> verbatim (fenced, lossless, + index)
     * documentation XML         -> transform (structured Markdown)
+    *   (or --yaml / --xml-mode=yaml: XML -> structure-preserving .yaml)
     * HTML/EPUB/RTF/ODT         -> pandoc
 
     Maximum *local* effort is the default (pdfmux ``quality="standard"`` — the
@@ -210,6 +211,8 @@ class FileRecord:
     structural_reason: Optional[str] = None
     similarity_ok: Optional[bool] = None
     confidence_ok: Optional[bool] = None
+    fidelity_ok: Optional[bool] = None  # --yaml: YAML round-trips to source XML
+    fidelity_reason: Optional[str] = None
     passed: Optional[bool] = None
     preview: bool = False
     used_llm: bool = False
@@ -221,11 +224,15 @@ class FileRecord:
 # --------------------------------------------------------------------------- #
 
 
-def check_dependencies() -> Dict[str, bool]:
+def check_dependencies(*, need_yaml: bool = False) -> Dict[str, bool]:
     """Probe for the external tools / packages we rely on.
 
     Returns a mapping of dependency name -> availability. Prints actionable
     install instructions for anything missing rather than failing silently.
+
+    ``xmltodict``/``PyYAML`` are optional (only ``--yaml`` needs them), so they
+    are probed and warned about only when ``need_yaml`` is set — keeping the
+    output clean for the common Markdown-only run.
     """
     import importlib.util
 
@@ -262,9 +269,21 @@ def check_dependencies() -> Dict[str, bool]:
         ),
     }
 
+    if need_yaml:
+        available["xmltodict"] = importlib.util.find_spec("xmltodict") is not None
+        available["yaml"] = importlib.util.find_spec("yaml") is not None
+        instructions["xmltodict"] = instructions["yaml"] = (
+            "--yaml needs the 'xmltodict' and 'PyYAML' packages, which are not "
+            "importable.\n"
+            "    Install them with:  pip install -r requirements.txt"
+        )
+
+    seen: set = set()
     for name, ok in available.items():
-        if not ok:
-            print("[warning] " + instructions[name], file=sys.stderr)
+        msg = instructions[name]
+        if not ok and msg not in seen:  # yaml deps share one message -> warn once
+            print("[warning] " + msg, file=sys.stderr)
+            seen.add(msg)
 
     return available
 
@@ -1133,14 +1152,58 @@ def xml_to_markdown_transform(path: Path, raw: str) -> str:
     return "\n".join(lines)
 
 
-def convert_xml(src: Path, dest: Path, mode: str = "auto") -> Tuple[str, str]:
-    """Convert XML to Markdown. ``mode`` is auto | verbatim | transform.
+def xml_to_yaml(raw: str) -> str:
+    """Convert XML to YAML (structure-preserving, low-token, no Markdown wrapper).
 
-    Returns ``(markdown, mode_used)``. Verbatim is lossless and the safe default
-    for unknown/config XML; transform is for documentation-style XML.
+    Uses ``xmltodict`` to build a dict — attributes become ``@name`` keys, element
+    text ``#text``, and repeated siblings collapse to lists — then dumps YAML with
+    document order preserved. Intended for configuration XML headed for LLM/RAG
+    ingestion (e.g. NotebookLM, which won't parse XML fenced inside Markdown).
+
+    Lossy for XML comments and processing instructions, and awkward for mixed
+    prose+inline-tag content, so it is *not* used for documentation-style XML.
+
+    Raises ``RuntimeError`` if the optional ``xmltodict``/``PyYAML`` packages are
+    not installed; propagates ``expat.ExpatError`` on malformed XML so callers can
+    fall back to a lossless Markdown rendering.
     """
+    try:
+        import xmltodict
+        import yaml
+    except ImportError as exc:
+        raise RuntimeError(
+            "--yaml needs the 'xmltodict' and 'PyYAML' packages; "
+            "install them with:  pip install -r requirements.txt"
+        ) from exc
+    parsed = xmltodict.parse(raw)
+    return yaml.dump(parsed, default_flow_style=False, sort_keys=False, allow_unicode=True)
+
+
+def convert_xml(src: Path, dest: Path, mode: str = "auto") -> Tuple[str, str, Path]:
+    """Convert XML to Markdown or YAML. ``mode`` is auto | verbatim | transform | yaml.
+
+    Returns ``(content, mode_used, dest_written)``. Verbatim is lossless and the
+    safe default for unknown/config XML; transform is for documentation-style XML;
+    yaml emits structure-preserving YAML to a sibling ``.yaml`` file (the output
+    path differs from the ``.md`` ``dest`` passed in, hence the returned path).
+
+    A ``yaml`` request on malformed XML falls back to lossless ``verbatim``
+    Markdown; a missing optional dependency is a hard error.
+    """
+    import xml.parsers.expat
+
     raw = src.read_text(encoding="utf-8", errors="replace")
     chosen = xml_choose_mode(src, raw) if mode == "auto" else mode
+    if chosen == "yaml":
+        try:
+            content = xml_to_yaml(raw)
+        except xml.parsers.expat.ExpatError:
+            chosen = "verbatim"  # malformed XML -> lossless Markdown fallback
+        else:
+            yaml_dest = dest.with_suffix(".yaml")
+            yaml_dest.parent.mkdir(parents=True, exist_ok=True)
+            yaml_dest.write_text(content, encoding="utf-8")
+            return content, "yaml", yaml_dest
     if chosen == "transform":
         try:
             markdown = xml_to_markdown_transform(src, raw)
@@ -1150,7 +1213,7 @@ def convert_xml(src: Path, dest: Path, mode: str = "auto") -> Tuple[str, str]:
         markdown = xml_to_markdown_verbatim(src, raw)
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_text(markdown, encoding="utf-8")
-    return markdown, chosen
+    return markdown, chosen, dest
 
 
 # --------------------------------------------------------------------------- #
@@ -1240,6 +1303,62 @@ def structural_check(
     return True, None
 
 
+def _count_yaml_keys(node) -> int:
+    """Recursively count mapping keys in a parsed YAML structure."""
+    if isinstance(node, dict):
+        return len(node) + sum(_count_yaml_keys(v) for v in node.values())
+    if isinstance(node, list):
+        return sum(_count_yaml_keys(v) for v in node)
+    return 0
+
+
+def yaml_structural_check(content: str) -> Tuple[Dict[str, int], bool, Optional[str]]:
+    """Structural validity for ``--yaml`` output: it must parse and be non-empty.
+
+    Replaces the Markdown-oriented :func:`structural_check` for YAML output, which
+    legitimately contains no headings/tables/code fences. Returns
+    ``(counts, ok, reason)`` mirroring the Markdown path's shape.
+    """
+    import yaml
+
+    try:
+        data = yaml.safe_load(content)
+    except yaml.YAMLError as exc:
+        return {"keys": 0}, False, "output is not valid YAML: %s" % exc
+    keys = _count_yaml_keys(data)
+    if data is None or keys == 0:
+        return {"keys": keys}, False, "YAML output is empty (no mapping keys)"
+    return {"keys": keys}, True, None
+
+
+def yaml_fidelity_check(
+    yaml_content: str, source_xml: Optional[str]
+) -> Tuple[Optional[bool], Optional[str]]:
+    """Verify ``--yaml`` output reproduces the source XML's structure exactly.
+
+    Re-parses the emitted YAML and compares it to ``xmltodict``'s parse of the
+    source XML. Because the conversion is ``yaml.dump(xmltodict.parse(xml))``, a
+    faithful run must satisfy ``safe_load(yaml) == xmltodict.parse(xml)``; any
+    mismatch means a bad parse/serialization path (e.g. a scalar that YAML
+    re-reads as a bool/null), which this fails on rather than shipping silently.
+
+    Returns ``(None, None)`` when no source is available (fidelity unassessable).
+    """
+    if source_xml is None:
+        return None, None
+    try:
+        import xmltodict
+        import yaml
+
+        expected = xmltodict.parse(source_xml)
+        actual = yaml.safe_load(yaml_content)
+    except Exception as exc:  # noqa: BLE001 - any failure means we can't vouch for it
+        return False, "could not verify YAML fidelity: %s" % exc
+    if actual == expected:
+        return True, None
+    return False, "YAML output does not round-trip to the source XML structure"
+
+
 def validate(
     markdown: str,
     original_plaintext: Optional[str],
@@ -1247,6 +1366,8 @@ def validate(
     similarity_threshold: float = DEFAULT_SIMILARITY_THRESHOLD,
     confidence: Optional[float] = None,
     min_confidence: float = DEFAULT_MIN_CONFIDENCE,
+    output_format: str = "markdown",
+    source_xml: Optional[str] = None,
 ) -> Dict[str, object]:
     """Run fidelity + confidence + structural checks and decide pass/fail.
 
@@ -1259,10 +1380,23 @@ def validate(
     similarity is high the conversion is demonstrably faithful, so a
     prose-heavy doc that simply lacks structure is flagged (``structural_ok``)
     but not failed.
+
+    ``output_format="yaml"`` switches the structural check from Markdown elements
+    to YAML validity (the output must parse and be a non-empty mapping), since
+    ``--yaml`` output legitimately has no headings/tables/code fences. When
+    ``source_xml`` is also supplied, the YAML is additionally verified to
+    round-trip to the source XML's structure (``fidelity_ok``); a mismatch fails
+    the document.
     """
-    counts = structural_counts(markdown)
-    plain = strip_markdown(markdown)
-    struct_ok, struct_reason = structural_check(counts, plain)
+    fidelity_ok: Optional[bool] = None
+    fidelity_reason: Optional[str] = None
+    if output_format == "yaml":
+        counts, struct_ok, struct_reason = yaml_structural_check(markdown)
+        fidelity_ok, fidelity_reason = yaml_fidelity_check(markdown, source_xml)
+    else:
+        counts = structural_counts(markdown)
+        plain = strip_markdown(markdown)
+        struct_ok, struct_reason = structural_check(counts, plain)
 
     similarity: Optional[float] = None
     sim_ok: Optional[bool] = None
@@ -1276,7 +1410,12 @@ def validate(
 
     # Structural emptiness is fatal only when fidelity is otherwise unverifiable.
     struct_fatal = (not struct_ok) and (sim_ok is None)
-    passed = (sim_ok is not False) and (conf_ok is not False) and not struct_fatal
+    passed = (
+        (sim_ok is not False)
+        and (conf_ok is not False)
+        and (fidelity_ok is not False)
+        and not struct_fatal
+    )
 
     return {
         "similarity": similarity,
@@ -1285,6 +1424,8 @@ def validate(
         "structural": counts,
         "structural_ok": struct_ok,
         "structural_reason": struct_reason,
+        "fidelity_ok": fidelity_ok,
+        "fidelity_reason": fidelity_reason,
         "passed": bool(passed),
     }
 
@@ -1354,6 +1495,8 @@ def process_file(
     try:
         original_plaintext: Optional[str] = None
         confidence: Optional[float] = None
+        output_format = "markdown"
+        source_xml: Optional[str] = None
 
         if fmt == "pdf":
             if not deps.get("pdfmux"):
@@ -1378,8 +1521,11 @@ def process_file(
             original_plaintext = wc.ref_plaintext
             record.figures = {"diagrams": 0, "images": wc.images, "complex_tables": 0}
         elif fmt == "xml":
-            markdown, mode_used = convert_xml(src, dest, mode=xml_mode)
+            markdown, mode_used, dest = convert_xml(src, dest, mode=xml_mode)
             record.converter = "xml-%s" % mode_used
+            output_format = "yaml" if mode_used == "yaml" else "markdown"
+            if output_format == "yaml":
+                source_xml = src.read_text(encoding="utf-8", errors="replace")
         elif fmt == "doc-binary":
             raise RuntimeError(
                 "legacy binary .doc (OLE) needs LibreOffice/antiword; not supported. "
@@ -1398,6 +1544,8 @@ def process_file(
             similarity_threshold=similarity_threshold,
             confidence=confidence,
             min_confidence=min_confidence,
+            output_format=output_format,
+            source_xml=source_xml,
         )
         record.similarity = result["similarity"]  # type: ignore[assignment]
         record.similarity_ok = result["similarity_ok"]  # type: ignore[assignment]
@@ -1405,6 +1553,8 @@ def process_file(
         record.structural = result["structural"]  # type: ignore[assignment]
         record.structural_ok = result["structural_ok"]  # type: ignore[assignment]
         record.structural_reason = result["structural_reason"]  # type: ignore[assignment]
+        record.fidelity_ok = result["fidelity_ok"]  # type: ignore[assignment]
+        record.fidelity_reason = result["fidelity_reason"]  # type: ignore[assignment]
         record.passed = result["passed"]  # type: ignore[assignment]
         record.status = "converted"
     except Exception as exc:  # noqa: BLE001 - record any failure, keep batch going
@@ -1493,6 +1643,8 @@ def print_summary(records: List[FileRecord], top_n: int = 10) -> None:
             reasons.append("low confidence %.2f" % (r.pdfmux_confidence or 0.0))
         if r.structural_ok is False:
             reasons.append(r.structural_reason or "structural")
+        if r.fidelity_ok is False:
+            reasons.append(r.fidelity_reason or "YAML fidelity")
         if reasons:
             print("  FAIL %s — %s" % (r.filename, "; ".join(reasons)))
 
@@ -1649,10 +1801,17 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="Render DPI for extracted PNGs (default: %d)" % DEFAULT_FIGURE_DPI,
     )
     parser.add_argument(
-        "--xml-mode", choices=("auto", "verbatim", "transform"), default="auto",
+        "--xml-mode", choices=("auto", "verbatim", "transform", "yaml"), default="auto",
         help="XML handling: 'verbatim' (fenced, lossless — for syntax-critical "
-        "config), 'transform' (structured Markdown — for documentation XML), or "
-        "'auto' (default: detect by content).",
+        "config), 'transform' (structured Markdown — for documentation XML), "
+        "'yaml' (structure-preserving YAML to a .yaml file — low-token, parser- "
+        "friendly for LLM/RAG ingestion), or 'auto' (default: detect by content).",
+    )
+    parser.add_argument(
+        "--yaml", action="store_true",
+        help="Shorthand for --xml-mode=yaml: emit XML inputs as YAML (.yaml) "
+        "instead of Markdown. Applies to XML only; other formats are unaffected. "
+        "Takes precedence over --xml-mode.",
     )
     parser.add_argument(
         "--preview", action="store_true",
@@ -1683,7 +1842,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         output_dir = base / "markdown"
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    deps = check_dependencies()
+    xml_mode = "yaml" if args.yaml else args.xml_mode
+    deps = check_dependencies(need_yaml=xml_mode == "yaml")
     if not any(deps.values()):
         print(
             "error: none of pdfmux / pandoc / pdftotext are available; nothing "
@@ -1720,7 +1880,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         min_confidence=args.min_confidence,
         preview_pages=preview_pages,
         visual_cfg=visual_cfg,
-        xml_mode=args.xml_mode,
+        xml_mode=xml_mode,
         used_llm=used_llm,
         deps=deps,
     )

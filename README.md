@@ -44,6 +44,7 @@ so they can be imported and unit-tested on their own.
 | **`.docx`** (Word, Google Docs) | [pandoc](https://pandoc.org/) (`--extract-media`) | semantic structure + embedded images |
 | **Confluence "Word" export** (MHTML, usually `.doc`) | extract HTML + base64 images (stdlib) → pandoc | images recovered & inlined; UI icons filtered |
 | **Config XML** (syntax-critical) | **verbatim** — fenced ```xml``` + generated index | lossless; exact tags/attributes/values preserved |
+| **Config XML → YAML** (opt-in `--yaml`) | structure-preserving YAML (`.yaml`) | lower-token grounding for LLMs; round-trip-verified against the source XML |
 | **Documentation XML** | **transform** — structured Markdown (headings/lists) | for XML that is really a document |
 | HTML / EPUB / RTF / ODT | pandoc | |
 | legacy binary `.doc` (OLE) | — | not supported; re-save as `.docx` or export PDF |
@@ -81,6 +82,15 @@ export of a given document:
   config verbatim, so exact tags/attributes/values survive (which a PDF
   round-trip would mangle). The Markdown output is suitable for downstream LLM
   tools without the lossy PDF step.
+  - For LLM grounding specifically, pass **`--yaml`** to emit the XML as
+    structure-preserving YAML (`.yaml`) instead. YAML carries the same data as
+    fenced-XML Markdown but **without the closing-tag and angle-bracket
+    overhead, so it consumes markedly fewer tokens** — the reason this mode
+    exists. Every file is verified to round-trip back to the source XML, so the
+    saving costs no fidelity (the only things dropped are XML comments and
+    processing instructions). Best for config-style XML; documentation-style XML
+    (prose with mid-sentence inline tags) reads better as Markdown — leave
+    `--yaml` off for those.
 
 ### Figure & table extraction
 
@@ -189,7 +199,8 @@ reprocess generated output.
 | `--no-figures` | off | Text-only Markdown (disable all image extraction). |
 | `--vector-diagrams` | off | Best-effort vector-diagram extraction (see caveat). |
 | `--figure-dpi N` | `150` | Render DPI for extracted PNGs. |
-| `--xml-mode {auto,verbatim,transform}` | `auto` | XML handling: `verbatim` (lossless, for config), `transform` (structured Markdown, for doc-XML), or auto-detect. |
+| `--xml-mode {auto,verbatim,transform,yaml}` | `auto` | XML handling: `verbatim` (lossless fenced, for config), `transform` (structured Markdown, for doc-XML), `yaml` (structure-preserving `.yaml`), or auto-detect. |
+| `--yaml` | off | Shorthand for `--xml-mode=yaml`: emit XML as YAML (`.yaml`) — fewer tokens than Markdown, round-trip-verified to the source. XML inputs only; takes precedence over `--xml-mode`. |
 | `--preview` | off | Process only the first few pages of each PDF (quick sanity check). |
 | `--preview-pages N` | `3` | Pages to use with `--preview`. |
 
@@ -207,6 +218,9 @@ python3 doc2md.py ./docs ./out
 
 # Quick sanity check on the first 3 pages
 python3 doc2md.py ./docs --preview
+
+# Config XML → low-token YAML for LLM grounding (verified lossless)
+python3 doc2md.py ./configs --yaml
 
 # Diagram-centric corpus, higher-res figures
 python3 doc2md.py ./docs --vector-diagrams --figure-dpi 200
