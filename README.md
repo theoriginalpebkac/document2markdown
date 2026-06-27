@@ -194,7 +194,7 @@ reprocess generated output.
 | Option | Default | Description |
 | --- | --- | --- |
 | `-w`, `--workers N` | `4` | Parallel worker count. |
-| `-t`, `--threshold R` | `0.90` | Minimum text-similarity ratio to pass validation. |
+| `-t`, `--threshold R` | `0.90` | Minimum text-similarity ratio to pass validation. Web (MHTML) exports are capped at a relaxed `0.80` bar, since SPA chrome and per-token code markup make their character-diff inherently noisier than PDF/DOCX. |
 | `--min-confidence R` | `0.70` | Minimum pdfmux confidence to pass. |
 | `-q`, `--quality {fast,standard,high}` | `standard` | Local extraction quality; `standard` is the max local effort. |
 | `--llm {gemini,claude,openai,ollama}` | off | Enable LLM fallback for hard documents. |
