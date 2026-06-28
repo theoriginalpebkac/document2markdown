@@ -53,7 +53,16 @@ so they can be imported and unit-tested on their own.
 
 The default is the strongest **local** pipeline: pdfmux `quality=standard` (the
 full agentic audit → re-extract loop) with whatever local backends you install
-(OCR, Docling tables). No document is sent to a cloud service by default.
+(OCR, Docling tables). Very large PDFs (over `--large-doc-pages`, default 1000)
+automatically drop to `fast` — Docling's per-page table model would otherwise
+turn a multi-thousand-page doc into a near-hour run for little fidelity gain.
+OCR is skipped on born-digital PDFs (`--ocr auto`), since the text layer is
+already authoritative. PDF Markdown is also cleaned for LLM consumption by
+default (safe page-number/date furniture, empty duplicate tables, line-wrap
+token splits; add `--strip-line` for corpus-specific chrome) — every cleanup
+pass is verified lossless and falls back to the raw text if not, so cleaning
+never costs fidelity; use `--no-clean` for the raw extraction. No document is
+sent to a cloud service by default.
 
 For the occasional document local extraction can't handle, opt in to an LLM:
 
@@ -195,11 +204,16 @@ reprocess generated output.
 | --- | --- | --- |
 | `-w`, `--workers N` | `4` | Parallel worker count. |
 | `-t`, `--threshold R` | `0.90` | Minimum text-similarity ratio to pass validation. Web (MHTML) exports are capped at a relaxed `0.80` bar, since SPA chrome and per-token code markup make their character-diff inherently noisier than PDF/DOCX. |
-| `--min-confidence R` | `0.70` | Minimum pdfmux confidence to pass. |
-| `-q`, `--quality {fast,standard,high}` | `standard` | Local extraction quality; `standard` is the max local effort. |
+| `--min-confidence R` | `0.70` | Minimum pdfmux confidence to pass. When confidence clears this bar, a low text-similarity score is reported but no longer fails the document — `pdftotext` is only a flat cross-check and mangles multi-column/tabular PDFs, so a faithful conversion can score low. |
+| `-q`, `--quality {auto,fast,standard,high}` | `auto` | Local extraction quality. `auto` uses `standard` (max local effort) but drops to `fast` for very large PDFs (see `--large-doc-pages`), where Docling's per-page table model isn't worth the time. `fast` = PyMuPDF only. |
+| `--large-doc-pages N` | `1000` | With `--quality=auto`, PDFs larger than N pages use `fast` instead of `standard`. |
+| `--ocr {auto,on,off}` | `auto` | OCR control for PDF extraction. `auto` skips OCR on born-digital PDFs (much faster, no fidelity loss — the text layer is authoritative) and keeps it for scanned/image PDFs. `on` forces it; `off` disables it. |
+| `--timeout SECONDS` | auto | Per-document extraction timeout (sets `PDFMUX_TIMEOUT`). Omitted: auto-scaled by page count (≥300s, ~3s/page) so large docs don't hit pdfmux's 300s default. `0` = no limit. |
 | `--llm {gemini,claude,openai,ollama}` | off | Enable LLM fallback for hard documents. |
 | `--llm-budget USD` | — | Per-document spend cap when `--llm` is set. |
 | `--no-figures` | off | Text-only Markdown (disable all image extraction). |
+| `--no-clean` | off (cleaning **on**) | Disable the default Markdown cleanup (PDF only): strips safe furniture (standalone page-number / date lines), drops empty duplicate tables, and repairs line-wrap token splits (e.g. `<a:b.ma x-c>` → `<a:b.max-c>`). Every pass is verified lossless by a non-whitespace character-conservation check and falls back to raw text if it can't be proven. Use `--no-clean` to keep the raw, true-to-source extraction. |
+| `--strip-line REGEX` | — | During cleanup, also remove lines that *fully* match REGEX — for document/corpus-specific header/footer chrome (company names, confidentiality notices, running titles) that can't be detected automatically. Repeatable. Still verified lossless. |
 | `--vector-diagrams` | off | Best-effort vector-diagram extraction (see caveat). |
 | `--figure-dpi N` | `150` | Render DPI for extracted PNGs. |
 | `--xml-mode {auto,verbatim,transform,yaml}` | `auto` | XML handling: `verbatim` (lossless fenced, for config), `transform` (structured Markdown, for doc-XML), `yaml` (structure-preserving `.yaml`), or auto-detect. |

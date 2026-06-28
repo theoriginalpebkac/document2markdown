@@ -59,6 +59,7 @@ from __future__ import annotations
 import argparse
 import difflib
 import json
+import logging
 import os
 import re
 import shutil
@@ -92,6 +93,18 @@ DEFAULT_WEB_SIMILARITY_THRESHOLD = 0.80
 DEFAULT_MIN_CONFIDENCE = 0.70
 DEFAULT_PREVIEW_PAGES = 3
 DEFAULT_FIGURE_DPI = 150
+# Above this page count, --quality=auto picks "fast" (pymupdf4llm only) instead
+# of "standard": on huge born-digital docs Docling's per-page table model turns
+# minutes into nearly an hour for little fidelity gain (~1.3s/page on standard,
+# ~0.2s/page on fast — measured on a 2,552-page doc: 55 min vs ~10 min).
+DEFAULT_LARGE_DOC_PAGES = 1000
+# Per-page wall-clock budget used to auto-scale PDFMUX_TIMEOUT (seconds/page).
+# Generous vs the ~1.3s/page worst case so large docs never hit pdfmux's 300s
+# default mid-extraction. pdfmux can't truly interrupt a running extraction, so
+# this is a ceiling, not a target.
+TIMEOUT_PER_PAGE_BUDGET = 3
+TIMEOUT_FLOOR = 300
+TIMEOUT_UNLIMITED = 86400  # what `--timeout 0` maps to (effectively no limit)
 
 # A document whose stripped plain-text is at least this many characters but has
 # zero headings, code blocks, tables, or extracted figures is structurally
@@ -196,6 +209,7 @@ class PdfConversion:
     confidence: Optional[float]  # document-level pdfmux confidence
     min_page_confidence: Optional[float]
     visuals: List[Visual] = field(default_factory=list)
+    cleaning: Dict[str, object] = field(default_factory=dict)
 
 
 @dataclass
@@ -208,6 +222,7 @@ class FileRecord:
     status: str = "pending"  # "converted" | "skipped" | "error"
     output_path: Optional[str] = None
     similarity: Optional[float] = None
+    similarity_method: Optional[str] = None  # "sequence" (difflib) | "containment"
     pdfmux_confidence: Optional[float] = None
     min_page_confidence: Optional[float] = None
     structural: Dict[str, int] = field(default_factory=dict)
@@ -225,6 +240,9 @@ class FileRecord:
     # the value chosen, why, and the flag to override it. Surfaced on stdout and
     # in conversion_report.json so an auto decision is never silent.
     auto_decisions: List[Dict[str, str]] = field(default_factory=list)
+    # Markdown-cleanup stats (lines/tables removed, splits repaired); empty when
+    # cleaning is disabled (--no-clean) or the format isn't PDF.
+    cleaning: Dict[str, object] = field(default_factory=dict)
     error: Optional[str] = None
 
 
@@ -792,35 +810,79 @@ def _pdf_is_text_based(path: Path) -> bool:
         doc.close()
 
 
-def install_docling_ocr_policy(mode: str) -> None:
-    """Control Docling's OCR for PDF table extraction inside pdfmux.
+def _doc_to_path(doc) -> Optional[Path]:
+    """Best-effort source path for a ``pymupdf4llm.to_markdown`` argument.
 
-    ``mode``:
-        * ``"on"``  — no-op; Docling keeps its default (OCR on every page).
-        * ``"off"`` — Docling OCR is disabled for every PDF.
-        * ``"auto"`` — Docling OCR is disabled for born-digital PDFs (see
-          :func:`_pdf_is_text_based`) and left on for scanned/image PDFs.
-
-    Implemented by replacing pdfmux's ``_get_converter`` with a stand-in whose
-    ``convert()`` picks an OCR-on or OCR-off Docling converter per source PDF.
-    Both real converters are built once and cached, so the only per-call work is
-    the (cheap, sampled) text-layer check. Never raises and never breaks the
-    pipeline: if pdfmux/Docling aren't importable in a shape we recognize, it
-    logs and leaves Docling's default in place.
+    ``doc`` may be a path (str/Path) or an open ``pymupdf.Document`` whose
+    ``.name`` is its file path. Returns ``None`` if neither yields a path.
     """
-    if mode == "on":
-        return
+    try:
+        if isinstance(doc, (str, Path)):
+            return Path(str(doc))
+        name = getattr(doc, "name", None)
+        if name:
+            return Path(name)
+    except Exception:
+        pass
+    return None
+
+
+def _patch_pymupdf4llm_ocr(mode: str) -> bool:
+    """Make pdfmux's pymupdf4llm extraction honor the OCR policy.
+
+    pdfmux's FastExtractor / multi-pass path calls ``pymupdf4llm.to_markdown``
+    *without* ``use_ocr``; with PyMuPDF's layout engine active that defaults to
+    OCR on, so Tesseract runs on every page the parser deems "needs OCR" — the
+    real cost (and the "Using Tesseract" / "Image too small to scale" noise) on
+    a born-digital, table-dense doc. We wrap ``to_markdown`` to inject
+    ``use_ocr=False`` when the per-file decision is "off", unless the caller set
+    ``use_ocr``/``force_ocr`` explicitly. No-op when the layout engine is
+    inactive (the legacy path does no OCR and would just warn about the kwarg).
+    Returns True if the patch is in place.
+    """
+    try:
+        import pymupdf4llm
+    except Exception:
+        return False
+    if not getattr(pymupdf4llm, "_use_layout", False):
+        return False  # legacy (non-layout) path does no OCR
+    if getattr(pymupdf4llm.to_markdown, "_doc2md_ocr_wrapped", False):
+        return True  # idempotent
+
+    _orig = pymupdf4llm.to_markdown
+
+    def _to_markdown(doc, *args, **kwargs):
+        if "use_ocr" not in kwargs and "force_ocr" not in kwargs:
+            src = _doc_to_path(doc)
+            if src is not None:
+                try:
+                    if _ocr_decision(src, mode)["choice"] == "off":
+                        kwargs["use_ocr"] = False
+                except Exception:
+                    pass  # err toward keeping OCR
+        return _orig(doc, *args, **kwargs)
+
+    _to_markdown._doc2md_ocr_wrapped = True  # type: ignore[attr-defined]
+    pymupdf4llm.to_markdown = _to_markdown
+    return True
+
+
+def _patch_docling_ocr(mode: str) -> bool:
+    """Make pdfmux's Docling table extraction honor the OCR policy.
+
+    Replaces pdfmux's ``_get_converter`` with a stand-in whose ``convert()``
+    picks an OCR-on or OCR-off Docling converter per source PDF (both built once
+    and cached, so the only per-call work is the cheap sampled text-layer
+    check). Returns True if the patch is in place; False (silently) when Docling
+    or pdfmux aren't importable — Docling is an optional extractor.
+    """
     try:
         from pdfmux.extractors import tables as _tables
         from docling.datamodel.base_models import InputFormat
         from docling.datamodel.pipeline_options import PdfPipelineOptions
         from docling.document_converter import DocumentConverter, PdfFormatOption
-    except Exception as exc:  # pragma: no cover - depends on optional deps
-        print(
-            "[info] OCR policy not applied (%s); Docling keeps its default" % exc,
-            file=sys.stderr,
-        )
-        return
+    except Exception:  # pragma: no cover - depends on optional deps
+        return False
 
     cache: Dict[bool, object] = {}
     lock = threading.Lock()
@@ -855,6 +917,121 @@ def install_docling_ocr_policy(mode: str) -> None:
     _tables._get_converter = lambda: _singleton
     # Some pdfmux versions read the cached singleton directly; keep it coherent.
     _tables._converter_instance = _singleton
+    return True
+
+
+def _pdf_page_count(path: Path) -> int:
+    """Page count for a PDF, or 0 if it can't be opened (no PyMuPDF / bad file)."""
+    if pymupdf is None:
+        return 0
+    try:
+        doc = pymupdf.open(str(path))
+    except Exception:
+        return 0
+    try:
+        return doc.page_count
+    finally:
+        doc.close()
+
+
+def resolve_timeout(arg_timeout: Optional[int], max_pages: int) -> int:
+    """Resolve the PDFMUX_TIMEOUT (seconds) for this run.
+
+    ``arg_timeout`` is the ``--timeout`` value: ``None`` auto-scales by the
+    largest input's page count (``max(TIMEOUT_FLOOR, pages * budget)``), ``0``
+    means effectively unlimited, and a positive value is used verbatim. pdfmux's
+    300s default is far too low for large docs, so the auto default scales up.
+    """
+    if arg_timeout is None:
+        return max(TIMEOUT_FLOOR, max_pages * TIMEOUT_PER_PAGE_BUDGET)
+    if arg_timeout <= 0:
+        return TIMEOUT_UNLIMITED
+    return arg_timeout
+
+
+def resolve_quality(quality: str, page_count: int, large_doc_pages: int) -> Tuple[str, Optional[Dict[str, str]]]:
+    """Resolve ``--quality`` for one PDF, returning (effective_quality, decision).
+
+    Only ``"auto"`` is resolved here: it picks ``"fast"`` for PDFs larger than
+    ``large_doc_pages`` (Docling's per-page cost is not worth it on huge
+    born-digital docs) and ``"standard"`` otherwise. The returned ``decision`` is
+    an :func:`_note_auto_decision`-shaped dict when the size-based downgrade
+    fires (so it's announced + recorded), else ``None``. Explicit qualities
+    (fast/standard/high) pass through unchanged with no decision.
+    """
+    if quality != "auto":
+        return quality, None
+    if page_count > large_doc_pages:
+        est_min = max(1, round(page_count * 0.2 / 60))  # ~0.2s/page on fast
+        return "fast", {
+            "setting": "quality",
+            "choice": "fast",
+            "reason": "auto: large PDF (%d pages > %d) — fast avoids ~%dx slower "
+            "Docling for little fidelity gain (~%d min est)"
+            % (page_count, large_doc_pages, 6, est_min),
+            "override": "--quality standard (force Docling tables)",
+        }
+    return "standard", None
+
+
+class _MinLevelFilter(logging.Filter):
+    """Drop log records below ``min_level``. Attached to a logger, it survives a
+    library re-setting its own level on import (which a plain ``setLevel`` would
+    not), because logger filters are consulted on every emit regardless of level.
+    """
+
+    def __init__(self, min_level: int) -> None:
+        super().__init__()
+        self.min_level = min_level
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return record.levelno >= self.min_level
+
+
+def quiet_third_party_logs() -> None:
+    """Silence noisy third-party chatter so only doc2md's own output shows.
+
+    Some extraction backends attach their own handlers / progress bars: RapidOCR
+    prints colored INFO lines for every model it loads, and Docling/transformers
+    emit a ``Loading weights`` tqdm bar. doc2md uses plain ``print`` for its
+    messages, so raising third-party log levels to WARNING hides none of ours —
+    and WARNING/ERROR still surface real problems. Idempotent; safe to call once
+    up front (it works even before the libraries are imported).
+    """
+    # Model-download / load progress bars ("Loading weights: 100%|...").
+    os.environ.setdefault("TQDM_DISABLE", "1")
+    os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+    warn_only = _MinLevelFilter(logging.WARNING)
+    for name in ("RapidOCR", "rapidocr", "docling", "transformers", "easyocr", "onnxruntime"):
+        lg = logging.getLogger(name)
+        lg.setLevel(logging.WARNING)
+        lg.addFilter(warn_only)
+
+
+def install_ocr_policy(mode: str) -> None:
+    """Control OCR across pdfmux's extraction engines per ``mode``.
+
+    ``"on"`` keeps every engine's default (OCR on); ``"off"`` disables OCR for
+    every PDF; ``"auto"`` disables OCR for born-digital PDFs (see
+    :func:`_pdf_is_text_based`) and keeps it for scanned/image PDFs.
+
+    The OCR work lives in two engines — **pymupdf4llm** (FastExtractor /
+    multi-pass) and **Docling** (table extraction) — so both are patched. Never
+    raises: an engine that isn't importable in a shape we recognize is simply
+    left at its default.
+    """
+    if mode == "on":
+        return
+    patched = []
+    if _patch_pymupdf4llm_ocr(mode):
+        patched.append("pymupdf4llm")
+    if _patch_docling_ocr(mode):
+        patched.append("docling")
+    if not patched:
+        print(
+            "[info] OCR policy not applied; extractors keep their defaults",
+            file=sys.stderr,
+        )
 
 
 def _extract_pdf_pages(src: Path, quality: str) -> Tuple[List[Tuple[int, str]], Optional[float], Optional[float]]:
@@ -892,11 +1069,22 @@ def convert_pdf(
     quality: str = "standard",
     preview_pages: Optional[int] = None,
     visual_cfg: Optional[VisualConfig] = None,
+    clean: bool = True,
+    strip_patterns: Optional[List[str]] = None,
 ) -> PdfConversion:
-    """Convert a PDF to Markdown (pdfmux) + extract visuals (PyMuPDF), write ``dest``."""
+    """Convert a PDF to Markdown (pdfmux) + extract visuals (PyMuPDF), write ``dest``.
+
+    When ``clean`` (default), the assembled Markdown is de-noised for LLM
+    consumption: furniture lines matching safe built-in patterns (bare page
+    number / date) or a user ``strip_patterns`` regex are removed, empty
+    duplicate tables are dropped, and line-wrap token splits are repaired. The
+    pass is character-conservation-checked and falls back to the raw text if
+    losslessness can't be proven.
+    """
     cfg = visual_cfg or VisualConfig()
     work_src = src
     tmpdir: Optional[tempfile.TemporaryDirectory] = None
+    cleaning: Dict[str, object] = {}
     try:
         if preview_pages is not None:
             tmpdir = tempfile.TemporaryDirectory(prefix="doc2md_preview_")
@@ -910,9 +1098,18 @@ def convert_pdf(
         if tmpdir is not None:
             tmpdir.cleanup()
 
+    if clean:
+        markdown, cleaning = clean_markdown(markdown, strip_patterns=strip_patterns)
+
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_text(markdown, encoding="utf-8")
-    return PdfConversion(markdown=markdown, confidence=confidence, min_page_confidence=min_conf, visuals=visuals)
+    return PdfConversion(
+        markdown=markdown,
+        confidence=confidence,
+        min_page_confidence=min_conf,
+        visuals=visuals,
+        cleaning=cleaning,
+    )
 
 
 def convert_with_pandoc(src: Path, dest: Path) -> str:
@@ -1605,6 +1802,245 @@ def similarity_ratio(original_text: str, markdown_text: str) -> float:
     return difflib.SequenceMatcher(None, a, b).ratio()
 
 
+# Above this normalized length, difflib's O(n*m) ratio is too slow to be worth
+# it (minutes on a multi-MB doc), so fall back to an O(n) token-recall metric.
+_SIMILARITY_SEQUENCE_MAX_CHARS = 200_000
+
+
+def _containment_ratio(original_text: str, markdown_text: str) -> float:
+    """O(n) token recall: fraction of the source's word tokens present in the md.
+
+    Order-insensitive, so it isn't fooled by the layout reflow that tanks
+    difflib on multi-column/tabular PDFs, and it's linear instead of quadratic.
+    """
+    from collections import Counter
+
+    src = Counter(re.findall(r"\w+", original_text.lower()))
+    out = Counter(re.findall(r"\w+", strip_markdown(markdown_text).lower()))
+    total = sum(src.values())
+    if total == 0:
+        return 1.0
+    covered = sum(min(n, out[w]) for w, n in src.items())
+    return covered / total
+
+
+def compute_similarity(original_text: str, markdown_text: str) -> Tuple[float, str]:
+    """Source-vs-Markdown fidelity score and the method used.
+
+    Uses difflib's character ratio for normal-size docs ("sequence"); for very
+    large docs it switches to the O(n) token-recall metric ("containment") so
+    validation doesn't spend minutes on an O(n*m) diff — which matters because
+    the score is only advisory when pdfmux confidence is high anyway.
+    """
+    a = _normalize_whitespace(original_text)
+    b = _normalize_whitespace(strip_markdown(markdown_text))
+    if not a and not b:
+        return 1.0, "sequence"
+    if max(len(a), len(b)) > _SIMILARITY_SEQUENCE_MAX_CHARS:
+        return _containment_ratio(original_text, markdown_text), "containment"
+    return difflib.SequenceMatcher(None, a, b).ratio(), "sequence"
+
+
+# --------------------------------------------------------------------------- #
+# Markdown cleanup (deterministic, lossless, default-on; --no-clean to skip)
+# --------------------------------------------------------------------------- #
+#
+# PDF extraction leaves non-content noise that hurts LLM consumption without
+# adding information: page headers/footers repeated on every page, empty
+# duplicate tables at page breaks, and word-fragments split across line-wraps
+# inside inline tags (e.g. ``<forward:...ma x-reconnects>``). We remove/repair
+# these with deterministic rules (no LLM) and *prove* losslessness with a
+# character-conservation check: every non-whitespace character of the input must
+# end up either in the cleaned output or in the audited set of removed lines.
+# The removal steps only delete provably-repeated furniture / empty tables; the
+# repair steps only delete whitespace (rejoining split tokens). If the check
+# fails for any reason, the original markdown is returned untouched — default-on
+# can therefore never silently lose detail.
+
+_TAGNAME_RE = re.compile(r"/?[A-Za-z][\w.:-]*")
+
+# Universally-safe furniture: standalone lines that are *only* a page number or
+# a date. Such lines are page chrome, effectively never body content. Textual
+# chrome (company names, "Confidential", running titles) can't be told from
+# content automatically on this scrambled single-blob output, so it's left to
+# the user's explicit ``--strip-line`` patterns rather than guessed at.
+_SAFE_FURNITURE_PATTERNS = [
+    re.compile(r"\d{1,5}"),  # bare page number
+    re.compile(r"\d{1,2}/\d{1,2}/\d{2,4}"),  # date m/d/yy or m/d/yyyy
+    re.compile(r"\d{4}-\d{1,2}-\d{1,2}"),  # date yyyy-mm-dd
+    re.compile(r"[Pp]age \d{1,5}(\s+of\s+\d{1,5})?"),  # "Page N" / "Page N of M"
+]
+
+
+def _nonspace_counter(s: str):
+    """Multiset of non-whitespace characters — the unit of the fidelity proof."""
+    from collections import Counter
+
+    return Counter(ch for ch in s if not ch.isspace())
+
+
+def _compile_strip_patterns(strip_patterns: Optional[List[str]]):
+    """Safe built-in furniture patterns plus any user ``--strip-line`` regexes.
+
+    Each user pattern is matched (``fullmatch``) against the *stripped* line, so
+    a pattern removes only lines it fully describes — never a substring of a
+    content line. Invalid regexes are skipped rather than aborting the run.
+    """
+    patterns = list(_SAFE_FURNITURE_PATTERNS)
+    for p in strip_patterns or []:
+        try:
+            patterns.append(re.compile(p))
+        except re.error:
+            print("[clean] ignoring invalid --strip-line regex: %r" % p, file=sys.stderr)
+    return patterns
+
+
+def _drop_empty_tables(lines: List[str]) -> Tuple[List[str], List[str]]:
+    """Drop table blocks whose data rows are all empty (page-break dup fragments).
+
+    Conservative: only blocks that have data rows *and* every data cell is blank
+    are removed; header-only tables are kept. Returns ``(kept, removed)``.
+    """
+    out: List[str] = []
+    removed: List[str] = []
+    i, n = 0, len(lines)
+
+    def is_row(ln: str) -> bool:
+        return ln.lstrip().startswith("|")
+
+    def is_delim(ln: str) -> bool:
+        return bool(_TABLE_DELIM_RE.match(ln))
+
+    def cells(ln: str) -> List[str]:
+        return [c.strip() for c in ln.strip().strip("|").split("|")]
+
+    while i < n:
+        if is_row(lines[i]) and i + 1 < n and is_delim(lines[i + 1]):
+            j = i + 2
+            data = []
+            while j < n and is_row(lines[j]) and not is_delim(lines[j]):
+                data.append(j)
+                j += 1
+            if data and all(all(c == "" for c in cells(lines[k])) for k in data):
+                removed.extend(lines[i:j])
+                i = j
+                continue
+        out.append(lines[i])
+        i += 1
+    return out, removed
+
+
+def _repair_xml_tag_splits(text: str) -> Tuple[str, int]:
+    """Rejoin tag paths split by a line-wrap space, e.g. ``<a:b.ma x-c>``.
+
+    Only touches ``<...>`` whose contents (minus spaces) form a valid element-tag
+    name and which carry no attributes (no ``=``/quotes), so prose like ``x < 5
+    and y > 3`` is never altered. Deletes whitespace only.
+    """
+    n = 0
+
+    def repl(m: "re.Match") -> str:
+        nonlocal n
+        inner = m.group(1)
+        if " " not in inner or "=" in inner or '"' in inner or "'" in inner:
+            return m.group(0)
+        joined = inner.replace(" ", "")
+        if _TAGNAME_RE.fullmatch(joined):
+            n += 1
+            return "<" + joined + ">"
+        return m.group(0)
+
+    return re.sub(r"<([^<>]*)>", repl, text), n
+
+
+def _dehyphenate_table_cells(text: str) -> Tuple[str, int]:
+    """Rejoin enum values wrap-split inside table cells, e.g. ``client -request``.
+
+    Scoped to table rows and to ``word -word`` (no space after the hyphen), so
+    real dashes (``a - b``) and prose are untouched. Deletes whitespace only.
+    """
+    n = 0
+    pat = re.compile(r"(\w) -(\w)")
+    lines = text.split("\n")
+    for idx, ln in enumerate(lines):
+        if ln.lstrip().startswith("|"):
+            new, k = pat.subn(r"\1-\2", ln)
+            if k:
+                n += k
+                lines[idx] = new
+    return "\n".join(lines), n
+
+
+def _collapse_blank_runs(text: str) -> str:
+    """Strip per-line trailing whitespace and collapse 3+ blank lines to one."""
+    text = "\n".join(ln.rstrip() for ln in text.split("\n"))
+    return re.sub(r"\n{3,}", "\n\n", text)
+
+
+def clean_markdown(
+    md: str, *, strip_patterns: Optional[List[str]] = None
+) -> Tuple[str, Dict[str, object]]:
+    """Clean assembled PDF-derived Markdown for LLM consumption.
+
+    Removes furniture lines that fully match a safe built-in pattern (bare page
+    number / date) or a user ``--strip-line`` regex; drops empty duplicate
+    tables (page-break fragments); and repairs line-wrap token splits inside
+    tags / table cells. Returns ``(cleaned, stats)``.
+
+    Guarantees no data-fidelity loss via a non-whitespace character-conservation
+    check: ``chars(input) == chars(cleaned) + chars(removed)`` — furniture
+    removal only drops whole audited lines, the repair steps delete only
+    whitespace. If that can't be shown (or anything errors), the original is
+    returned with ``stats["fell_back"]`` set, so callers always ship faithful
+    Markdown.
+    """
+    stats: Dict[str, object] = {
+        "applied": False,
+        "fell_back": False,
+        "furniture_lines_removed": 0,
+        "empty_table_rows_removed": 0,
+        "xml_tag_joins": 0,
+        "cell_dehyphenations": 0,
+        "furniture_samples": [],
+    }
+    try:
+        patterns = _compile_strip_patterns(strip_patterns)
+        removed: List[str] = []
+        kept: List[str] = []
+        for ln in md.split("\n"):
+            s = ln.strip()
+            if s and any(p.fullmatch(s) for p in patterns):
+                removed.append(ln)
+            else:
+                kept.append(ln)
+        stats["furniture_lines_removed"] = len(removed)
+        stats["furniture_samples"] = sorted({r.strip() for r in removed})[:15]
+
+        kept, removed_tbl = _drop_empty_tables(kept)
+        removed.extend(removed_tbl)
+        stats["empty_table_rows_removed"] = len(removed_tbl)
+
+        text = "\n".join(kept)
+        text, n_xml = _repair_xml_tag_splits(text)
+        text, n_cell = _dehyphenate_table_cells(text)
+        cleaned = _collapse_blank_runs(text)
+
+        # Fidelity gate: every non-whitespace character is preserved in the
+        # output or accounted for in the removed (audited) lines.
+        if _nonspace_counter(md) != _nonspace_counter(cleaned) + _nonspace_counter("\n".join(removed)):
+            stats["fell_back"] = True
+            return md, stats
+
+        stats["xml_tag_joins"] = n_xml
+        stats["cell_dehyphenations"] = n_cell
+        stats["applied"] = True
+        return cleaned, stats
+    except Exception as exc:  # pragma: no cover - cleanup must never break a run
+        stats["fell_back"] = True
+        stats["error"] = str(exc)
+        return md, stats
+
+
 def structural_counts(md: str) -> Dict[str, int]:
     """Count headings, fenced code blocks, pipe tables, and image references."""
     return {
@@ -1710,6 +2146,13 @@ def validate(
     in which case the similarity check is skipped. ``confidence`` is pdfmux's
     document confidence (PDF only); below ``min_confidence`` fails the document.
 
+    Low pdftotext similarity is only a *hard* failure when there's no confident
+    extractor signal: pdftotext is a flat cross-check, not ground truth, and it
+    mangles multi-column/tabular PDFs (splitting words at line-wraps), so a
+    faithful pdfmux conversion can score low. When pdfmux confidence is high the
+    score is still reported (``similarity_ok``) but not fatal. Non-PDF inputs
+    carry no confidence, so similarity remains their gate.
+
     Structural emptiness (a long document with no headings/tables/code/figures)
     is only a *hard* failure when we have no fidelity signal — if text
     similarity is high the conversion is demonstrably faithful, so a
@@ -1735,8 +2178,9 @@ def validate(
 
     similarity: Optional[float] = None
     sim_ok: Optional[bool] = None
+    sim_method: Optional[str] = None
     if original_plaintext is not None:
-        similarity = similarity_ratio(original_plaintext, markdown)
+        similarity, sim_method = compute_similarity(original_plaintext, markdown)
         sim_ok = similarity >= similarity_threshold
 
     conf_ok: Optional[bool] = None
@@ -1745,8 +2189,16 @@ def validate(
 
     # Structural emptiness is fatal only when fidelity is otherwise unverifiable.
     struct_fatal = (not struct_ok) and (sim_ok is None)
+    # Low pdftotext similarity is fatal only when we lack a confident extractor
+    # signal. pdftotext is a flat cross-check, not ground truth: on multi-column
+    # / tabular PDFs it shatters words at line-wraps (e.g. "configuration" ->
+    # "config" + "uration"), so a faithful (often cleaner) pdfmux conversion can
+    # score low. When pdfmux reports high confidence we keep the score visible
+    # (similarity_ok=False) but don't fail on it. Non-PDF inputs have no
+    # confidence, so similarity still gates them.
+    sim_fatal = (sim_ok is False) and (conf_ok is not True)
     passed = (
-        (sim_ok is not False)
+        (not sim_fatal)
         and (conf_ok is not False)
         and (fidelity_ok is not False)
         and not struct_fatal
@@ -1754,6 +2206,7 @@ def validate(
 
     return {
         "similarity": similarity,
+        "similarity_method": sim_method,
         "similarity_ok": sim_ok,
         "confidence_ok": conf_ok,
         "structural": counts,
@@ -1787,25 +2240,56 @@ def _output_path_for(src: Path, input_root: Path, output_dir: Path) -> Path:
     return output_dir / rel.parent / (slugify(rel.stem) + ".md")
 
 
-def _note_auto_decision(record: FileRecord, decision: Dict[str, str]) -> None:
-    """Record an auto-made choice on ``record`` and echo it with its override.
+def _note_auto_decision(
+    record: FileRecord, decision: Dict[str, str], *, announce: bool = True
+) -> None:
+    """Record an auto-made choice on ``record`` and (optionally) echo it.
 
-    Keeps stdout and ``conversion_report.json`` in lockstep: every entry added
-    to ``record.auto_decisions`` is also printed, so an automatic decision is
-    visible both interactively and in the machine-readable report.
+    Keeps ``conversion_report.json`` authoritative: every entry is added to
+    ``record.auto_decisions``. When ``announce`` is True it's also printed with
+    its override hint, so notable decisions are visible interactively. Pass
+    ``announce=False`` for unremarkable defaults (e.g. quality resolving to the
+    usual ``standard``) to keep batch output clean while still recording them.
     """
     record.auto_decisions.append(decision)
-    print(
-        "[auto] %s: %s = %s — %s (override: %s)"
-        % (
-            record.filename,
-            decision["setting"],
-            decision["choice"],
-            decision["reason"],
-            decision["override"],
-        ),
-        file=sys.stderr,
-    )
+    if announce:
+        print(
+            "[auto] %s: %s = %s — %s (override: %s)"
+            % (
+                record.filename,
+                decision["setting"],
+                decision["choice"],
+                decision["reason"],
+                decision["override"],
+            ),
+            file=sys.stderr,
+        )
+
+
+def _report_cleaning(record: FileRecord) -> None:
+    """Echo a one-line cleanup summary (and any lossless-fallback) for a PDF."""
+    c = record.cleaning
+    if not c:
+        return
+    if c.get("fell_back"):
+        print(
+            "[clean] %s: skipped — losslessness not verifiable, kept raw text"
+            % record.filename,
+            file=sys.stderr,
+        )
+    if c.get("applied"):
+        print(
+            "[clean] %s: -%d furniture lines, -%d empty-table rows, "
+            "%d tag-splits + %d cell-splits repaired (lossless verified)"
+            % (
+                record.filename,
+                int(c.get("furniture_lines_removed", 0)),
+                int(c.get("empty_table_rows_removed", 0)),
+                int(c.get("xml_tag_joins", 0)),
+                int(c.get("cell_dehyphenations", 0)),
+            ),
+            file=sys.stderr,
+        )
 
 
 def process_file(
@@ -1821,6 +2305,9 @@ def process_file(
     visual_cfg: Optional[VisualConfig] = None,
     xml_mode: str = "auto",
     ocr_mode: str = "auto",
+    large_doc_pages: int = DEFAULT_LARGE_DOC_PAGES,
+    clean: bool = True,
+    strip_patterns: Optional[List[str]] = None,
     used_llm: bool = False,
 ) -> FileRecord:
     """Convert + validate a single file. Never raises — errors go in the record.
@@ -1859,18 +2346,26 @@ def process_file(
             if not deps.get("pdfmux"):
                 raise RuntimeError("pdfmux is not installed; cannot convert PDFs")
             record.converter = "pdfmux"
-            # Only Docling (standard quality) consults the OCR policy; the LLM
-            # path (quality="high") doesn't, so don't claim a decision there.
-            if quality != "high":
+            eff_quality, q_decision = resolve_quality(
+                quality, _pdf_page_count(src), large_doc_pages
+            )
+            if q_decision is not None:  # announce the large-doc fast downgrade
+                _note_auto_decision(record, q_decision)
+            # Only the local Docling/pymupdf4llm paths consult the OCR policy; the
+            # LLM path (quality="high") doesn't, so don't claim a decision there.
+            if eff_quality != "high":
                 _note_auto_decision(record, _ocr_decision(src, ocr_mode))
             conv = convert_pdf(
-                src, dest, quality=quality, preview_pages=preview_pages, visual_cfg=visual_cfg
+                src, dest, quality=eff_quality, preview_pages=preview_pages,
+                visual_cfg=visual_cfg, clean=clean, strip_patterns=strip_patterns,
             )
             markdown = conv.markdown
             confidence = conv.confidence
             record.pdfmux_confidence = conv.confidence
             record.min_page_confidence = conv.min_page_confidence
             record.figures = _figure_counts(conv.visuals)
+            record.cleaning = conv.cleaning
+            _report_cleaning(record)
             if deps.get("pdftotext"):
                 original_plaintext = extract_pdf_plaintext(src, last_page=preview_pages)
         elif fmt in ("mhtml", "docx"):
@@ -1921,6 +2416,7 @@ def process_file(
             source_xml=source_xml,
         )
         record.similarity = result["similarity"]  # type: ignore[assignment]
+        record.similarity_method = result["similarity_method"]  # type: ignore[assignment]
         record.similarity_ok = result["similarity_ok"]  # type: ignore[assignment]
         record.confidence_ok = result["confidence_ok"]  # type: ignore[assignment]
         record.structural = result["structural"]  # type: ignore[assignment]
@@ -2006,7 +2502,8 @@ def print_summary(records: List[FileRecord], top_n: int = 10) -> None:
         for r in scored[:top_n]:
             flag = "FAIL" if r.passed is False else "ok"
             conf = "" if r.pdfmux_confidence is None else " conf=%.2f" % r.pdfmux_confidence
-            print("  %-6s %.3f%s  %s" % (flag, r.similarity, conf, r.filename))
+            method = " (%s)" % r.similarity_method if r.similarity_method == "containment" else ""
+            print("  %-6s %.3f%s%s  %s" % (flag, r.similarity, conf, method, r.filename))
 
     for r in failed:
         reasons = []
@@ -2066,6 +2563,9 @@ def run_batch(
     visual_cfg: Optional[VisualConfig] = None,
     xml_mode: str = "auto",
     ocr_mode: str = "auto",
+    large_doc_pages: int = DEFAULT_LARGE_DOC_PAGES,
+    clean: bool = True,
+    strip_patterns: Optional[List[str]] = None,
     used_llm: bool = False,
     deps: Optional[Dict[str, bool]] = None,
 ) -> List[FileRecord]:
@@ -2106,6 +2606,9 @@ def run_batch(
                 visual_cfg=visual_cfg,
                 xml_mode=xml_mode,
                 ocr_mode=ocr_mode,
+                large_doc_pages=large_doc_pages,
+                clean=clean,
+                strip_patterns=strip_patterns,
                 used_llm=used_llm,
             ): f
             for f in files
@@ -2147,9 +2650,22 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="Minimum pdfmux confidence to pass (default: %.2f)" % DEFAULT_MIN_CONFIDENCE,
     )
     parser.add_argument(
-        "-q", "--quality", choices=("fast", "standard", "high"), default="standard",
-        help="pdfmux local extraction quality; 'standard' is the max local effort "
-        "(default). 'high' implies cloud LLM — prefer --llm for that.",
+        "-q", "--quality", choices=("auto", "fast", "standard", "high"), default="auto",
+        help="pdfmux local extraction quality. 'auto' (default): 'standard' "
+        "(max local effort), but 'fast' for very large PDFs (> --large-doc-pages) "
+        "where Docling's per-page cost isn't worth it. 'fast' = PyMuPDF only; "
+        "'high' implies cloud LLM — prefer --llm for that.",
+    )
+    parser.add_argument(
+        "--large-doc-pages", type=int, default=DEFAULT_LARGE_DOC_PAGES, metavar="N",
+        help="With --quality=auto, PDFs larger than N pages use 'fast' instead of "
+        "'standard' (default: %d)." % DEFAULT_LARGE_DOC_PAGES,
+    )
+    parser.add_argument(
+        "--timeout", type=int, default=None, metavar="SECONDS",
+        help="Per-document extraction timeout (sets PDFMUX_TIMEOUT). Omitted: "
+        "auto-scale by page count (max %ds, %ds/page) so large docs don't hit "
+        "pdfmux's 300s default. 0 = no limit." % (TIMEOUT_FLOOR, TIMEOUT_PER_PAGE_BUDGET),
     )
     parser.add_argument(
         "--ocr", choices=("auto", "on", "off"), default="auto",
@@ -2172,6 +2688,20 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--no-figures", action="store_true",
         help="Disable all figure/table image extraction (text-only Markdown).",
+    )
+    parser.add_argument(
+        "--no-clean", action="store_true",
+        help="Disable the default Markdown cleanup (PDF only). By default doc2md "
+        "strips safe furniture (bare page numbers / dates), drops empty duplicate "
+        "tables, and repairs line-wrap token splits — all verified lossless (it "
+        "falls back to raw text if not). Use this to keep the raw extraction.",
+    )
+    parser.add_argument(
+        "--strip-line", action="append", metavar="REGEX", default=None,
+        help="Remove lines that fully match REGEX during cleanup — for "
+        "document/corpus-specific header/footer chrome that can't be detected "
+        "automatically (e.g. 'Acme Corp, Inc\\.', 'Confidential.*'). Repeatable. "
+        "Matched against the whole stripped line; still verified lossless.",
     )
     parser.add_argument(
         "--vector-diagrams", action="store_true",
@@ -2225,6 +2755,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         output_dir = base / "markdown"
 
     output_dir.mkdir(parents=True, exist_ok=True)
+    quiet_third_party_logs()  # before any backend imports, so env/filters take
     xml_mode = "yaml" if args.yaml else args.xml_mode
     deps = check_dependencies(need_yaml=xml_mode == "yaml")
     if not any(deps.values()):
@@ -2247,11 +2778,33 @@ def main(argv: Optional[List[str]] = None) -> int:
         used_llm = True
         print("[info] LLM fallback enabled via provider '%s' (mode=premium)" % args.llm)
 
-    # Decide Docling's OCR behavior before any PDF is processed. Skips wasted
-    # full-page OCR on born-digital PDFs (the common slow/erroring case) while
-    # leaving it on for scanned docs. No-op when pdfmux is absent or --ocr=on.
+    # Size the extraction timeout before pdfmux is imported (its pipeline reads
+    # PDFMUX_TIMEOUT at import time). Auto-scale by the largest input PDF so big
+    # docs don't die at pdfmux's 300s default mid-extraction.
+    if deps.get("pdfmux"):
+        max_pages = 0
+        try:
+            _, _discovered = resolve_input(input_path)
+            max_pages = max(
+                (_pdf_page_count(f) for f in _discovered if f.suffix.lower() == ".pdf"),
+                default=0,
+            )
+        except Exception:
+            max_pages = 0
+        timeout_s = resolve_timeout(args.timeout, max_pages)
+        os.environ["PDFMUX_TIMEOUT"] = str(timeout_s)
+        print(
+            "[info] extraction timeout: %ds%s"
+            % (timeout_s, (" (largest input ~%d pages)" % max_pages) if max_pages else ""),
+            file=sys.stderr,
+        )
+
+    # Decide Docling/pymupdf4llm OCR behavior before any PDF is processed. Skips
+    # wasted full-page OCR on born-digital PDFs (the common slow/erroring case)
+    # while leaving it on for scanned docs. No-op when pdfmux is absent or
+    # --ocr=on.
     if deps.get("pdfmux") and args.ocr != "on":
-        install_docling_ocr_policy(args.ocr)
+        install_ocr_policy(args.ocr)
 
     visual_cfg = VisualConfig(
         enabled=not args.no_figures,
@@ -2271,6 +2824,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         visual_cfg=visual_cfg,
         xml_mode=xml_mode,
         ocr_mode=args.ocr,
+        large_doc_pages=args.large_doc_pages,
+        clean=not args.no_clean,
+        strip_patterns=args.strip_line,
         used_llm=used_llm,
         deps=deps,
     )
