@@ -10,6 +10,10 @@ Conversion (handler chosen by content sniffing, not extension)
     * documentation XML         -> transform (structured Markdown)
     *   (or --yaml / --xml-mode=yaml: XML -> structure-preserving .yaml)
     * HTML/EPUB/RTF/ODT         -> pandoc
+    * CSV                       -> one Markdown card per row (heading + key/value
+                                   fields; comma-delimited columns auto-detected
+                                   and expanded as bullet lists); supports
+                                   ``--split-file`` for RAG-optimal chunking
 
     Maximum *local* effort is the default (pdfmux ``quality="standard"`` — the
     full agentic audit/re-extract loop). Cloud LLM extraction is opt-in via
@@ -123,8 +127,9 @@ PDF_EXTENSIONS = {".pdf"}
 WORD_EXTENSIONS = {".docx", ".doc", ".mht", ".mhtml"}
 XML_EXTENSIONS = {".xml"}
 PANDOC_EXTENSIONS = {".html", ".htm", ".epub", ".rtf", ".odt"}
+CSV_EXTENSIONS = {".csv"}
 SUPPORTED_EXTENSIONS = (
-    PDF_EXTENSIONS | WORD_EXTENSIONS | XML_EXTENSIONS | PANDOC_EXTENSIONS
+    PDF_EXTENSIONS | WORD_EXTENSIONS | XML_EXTENSIONS | PANDOC_EXTENSIONS | CSV_EXTENSIONS
 )
 
 # Embedded raster images smaller than this (max dimension in px, or byte size
@@ -270,13 +275,15 @@ def check_dependencies(*, need_yaml: bool = False) -> Dict[str, bool]:
     import importlib.util
 
     available = {
+        "csv": True,  # stdlib, always available
         "pdfmux": importlib.util.find_spec("pdfmux") is not None,
         "pymupdf": pymupdf is not None,
         "pandoc": shutil.which("pandoc") is not None,
         "pdftotext": shutil.which("pdftotext") is not None,
     }
 
-    instructions = {
+    instructions: Dict[str, str] = {
+        "csv": "",  # always available (stdlib); no warning needed
         "pdfmux": (
             "pdfmux (PDF -> Markdown converter) is not importable.\n"
             "    Install it with:  pip install -r requirements.txt\n"
@@ -313,8 +320,8 @@ def check_dependencies(*, need_yaml: bool = False) -> Dict[str, bool]:
 
     seen: set = set()
     for name, ok in available.items():
-        msg = instructions[name]
-        if not ok and msg not in seen:  # yaml deps share one message -> warn once
+        msg = instructions.get(name, "")
+        if not ok and msg and msg not in seen:  # yaml deps share one message -> warn once
             print("[warning] " + msg, file=sys.stderr)
             seen.add(msg)
 
@@ -1198,6 +1205,8 @@ def detect_format(path: Path) -> str:
         return "pandoc"
     if path.suffix.lower() == ".docx":
         return "docx"
+    if path.suffix.lower() == ".csv":
+        return "csv"
     return "unsupported"
 
 
@@ -1212,6 +1221,16 @@ class WordConversion:
     images: int
     ref_plaintext: Optional[str]  # source text for the fidelity check
     cleaning: Dict[str, object] = field(default_factory=dict)
+
+
+@dataclass
+class CsvConversion:
+    """Return value of :func:`convert_csv`."""
+
+    cards: int
+    rows: int
+    output_paths: List[Path]
+    warnings: List[str] = field(default_factory=list)
 
 
 def _sniff_image(data: bytes) -> Optional[str]:
@@ -1782,6 +1801,234 @@ def convert_xml(src: Path, dest: Path, mode: str = "auto") -> Tuple[str, str, Pa
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_text(markdown, encoding="utf-8")
     return markdown, chosen, dest
+
+
+# --------------------------------------------------------------------------- #
+# CSV conversion — one Markdown card per row
+# --------------------------------------------------------------------------- #
+
+DEFAULT_CSV_LIST_MIN_SEGMENTS = 3
+DEFAULT_CSV_LIST_MAX_SEGMENT_LEN = 40
+
+
+def _parse_split_size(spec: str) -> int:
+    """Parse '3MB', '512K', '1.5M', or bare bytes -> int bytes."""
+    m = re.fullmatch(r"(\d+\.?\d*)\s*([KMGT]?)B?", spec.strip().upper())
+    if not m:
+        raise ValueError(
+            "unrecognized size %r — use e.g. 3MB, 512K, 1500000" % spec
+        )
+    n = float(m.group(1))
+    unit = m.group(2)
+    return int(n * {"": 1, "K": 1024, "M": 1024 ** 2, "G": 1024 ** 3, "T": 1024 ** 4}.get(unit, 1))
+
+
+def _detect_csv_list_columns(
+    rows: List[Dict[str, str]],
+    min_segments: int,
+    max_segment_len: int,
+    force_list: Optional[List[str]] = None,
+) -> set:
+    """Return column names whose values look like comma-separated lists.
+
+    For each column, sample all rows: if the median comma-segment count meets
+    ``min_segments`` AND the mean segment length is ≤ ``max_segment_len``
+    characters, the column is treated as a list. ``force_list`` columns are
+    always included regardless of heuristic. Both conditions must hold to
+    avoid flagging prose fields that happen to contain commas.
+    """
+    if not rows:
+        return set(force_list or [])
+    columns = list(rows[0].keys())
+    list_cols: set = set(force_list or [])
+    for col in columns:
+        if col in list_cols:
+            continue
+        values = [r.get(col, "").strip() for r in rows if r.get(col, "").strip()]
+        if not values:
+            continue
+        seg_counts = []
+        seg_lengths = []
+        for v in values:
+            segs = [s.strip() for s in v.split(",") if s.strip()]
+            seg_counts.append(len(segs))
+            if len(segs) > 1:
+                seg_lengths.extend(len(s) for s in segs)
+        median_segs = sorted(seg_counts)[len(seg_counts) // 2]
+        mean_len = sum(seg_lengths) / len(seg_lengths) if seg_lengths else 999
+        if median_segs >= min_segments and mean_len <= max_segment_len:
+            list_cols.add(col)
+    return list_cols
+
+
+def _detect_csv_title_column(
+    columns: List[str],
+    rows: List[Dict[str, str]],
+    override: Optional[str] = None,
+) -> Optional[str]:
+    """Column to use as the card heading — override, then name heuristic, then first non-ID."""
+    if override:
+        return override if override in columns else None
+    for col in columns:
+        cl = col.lower()
+        if cl in ("name", "title") or cl.endswith("name") or cl.endswith("title"):
+            return col
+    sample = rows[:20]
+    for col in columns:
+        cl = col.lower()
+        is_id = cl == "id" or cl.endswith("id")
+        vals = [r.get(col, "").strip() for r in sample if r.get(col, "").strip()]
+        all_numeric = bool(vals) and all(v.isdigit() for v in vals)
+        if not is_id and not all_numeric:
+            return col
+    return columns[0] if columns else None
+
+
+def _detect_csv_id_column(
+    columns: List[str], rows: List[Dict[str, str]]
+) -> Optional[str]:
+    """Column that looks like a record ID (name ends in 'id', or all-numeric values)."""
+    for col in columns:
+        cl = col.lower()
+        if cl == "id" or cl.endswith("id"):
+            return col
+    sample = rows[:20]
+    for col in columns:
+        vals = [r.get(col, "").strip() for r in sample if r.get(col, "").strip()]
+        if vals and all(v.isdigit() for v in vals):
+            return col
+    return None
+
+
+def _render_csv_card(
+    row: Dict[str, str],
+    title_col: Optional[str],
+    id_col: Optional[str],
+    list_cols: set,
+    skip_cols: set,
+) -> str:
+    """Render one CSV row as a self-contained Markdown card."""
+    title = row.get(title_col, "").strip() if title_col else ""
+    id_val = row.get(id_col, "").strip() if id_col else ""
+    if title and id_val:
+        heading = "## %s (ID: %s)" % (title, id_val)
+    elif title:
+        heading = "## %s" % title
+    elif id_val:
+        heading = "## ID: %s" % id_val
+    else:
+        heading = "## (unnamed)"
+
+    # Heading columns are already represented above — don't repeat them as fields.
+    heading_cols = {c for c in (title_col, id_col) if c}
+
+    lines = [heading, ""]
+    for col, val in row.items():
+        if col in skip_cols or col in heading_cols:
+            continue
+        val = val.strip()
+        if not val:
+            continue
+        if col in list_cols:
+            segs = [s.strip() for s in val.split(",") if s.strip()]
+            if len(segs) > 1:
+                lines.append("- **%s (%d):**" % (col, len(segs)))
+                for seg in segs:
+                    lines.append("  - %s" % seg)
+                continue
+        lines.append("- **%s:** %s" % (col, val))
+    return "\n".join(lines)
+
+
+def convert_csv(
+    src: Path,
+    dest: Path,
+    *,
+    list_min_segments: int = DEFAULT_CSV_LIST_MIN_SEGMENTS,
+    list_max_segment_len: int = DEFAULT_CSV_LIST_MAX_SEGMENT_LEN,
+    list_columns: Optional[List[str]] = None,
+    skip_columns: Optional[List[str]] = None,
+    title_column: Optional[str] = None,
+    split_bytes: Optional[int] = None,
+) -> CsvConversion:
+    """Convert a CSV to Markdown cards (one card per row) and write to ``dest``.
+
+    Each row becomes a ``##`` heading (auto-detected or overridden title column
+    + ID column) followed by key/value bullet fields. Columns whose values look
+    like comma-delimited lists (heuristic: median ≥ ``list_min_segments``
+    segments, mean length ≤ ``list_max_segment_len`` chars) are expanded as
+    indented bullet sub-lists instead of flat strings.
+
+    When ``split_bytes`` is set, output is split into ``<stem>-part001.md``,
+    ``<stem>-part002.md``, … at card boundaries so no file exceeds the threshold.
+    Cards are never split mid-card. The ``--clean`` pass is intentionally
+    skipped for CSV — the output is generated clean by construction.
+    """
+    import csv as _csv
+
+    with src.open(newline="", encoding="utf-8-sig") as fh:
+        reader = _csv.DictReader(fh)
+        rows = list(reader)
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+
+    if not rows:
+        dest.write_text("", encoding="utf-8")
+        return CsvConversion(cards=0, rows=0, output_paths=[dest])
+
+    columns = list(rows[0].keys())
+    skip_set = set(skip_columns or [])
+    list_cols = _detect_csv_list_columns(
+        rows, list_min_segments, list_max_segment_len, list_columns
+    )
+    title_col = _detect_csv_title_column(columns, rows, title_column)
+    id_col = _detect_csv_id_column(columns, rows)
+    if id_col == title_col:
+        id_col = None  # same column — just show it as the heading, no "(ID: …)"
+
+    warnings: List[str] = []
+    cards: List[str] = []
+    for row in rows:
+        title_val = row.get(title_col, "").strip() if title_col else ""
+        if not title_val:
+            warnings.append(
+                "empty heading value in row %d (title column: %s)"
+                % (len(cards) + 1, title_col or "<none>")
+            )
+        cards.append(_render_csv_card(row, title_col, id_col, list_cols, skip_set))
+
+    def _write_part(buf: List[str], path: Path) -> None:
+        path.write_text("\n\n---\n\n".join(buf) + "\n", encoding="utf-8")
+
+    if split_bytes is None:
+        _write_part(cards, dest)
+        return CsvConversion(cards=len(cards), rows=len(rows), output_paths=[dest], warnings=warnings)
+
+    # Split at card boundaries so no file exceeds split_bytes.
+    output_paths: List[Path] = []
+    part, buf, buf_size = 1, [], 0
+    sep_size = len("\n\n---\n\n".encode())
+
+    for card in cards:
+        card_bytes = len(card.encode())
+        overhead = sep_size if buf else 0
+        if buf and buf_size + overhead + card_bytes > split_bytes:
+            pth = dest.parent / ("%s-part%03d%s" % (dest.stem, part, dest.suffix))
+            _write_part(buf, pth)
+            output_paths.append(pth)
+            part += 1
+            buf, buf_size = [], 0
+        buf.append(card)
+        buf_size += (sep_size if len(buf) > 1 else 0) + card_bytes
+
+    if buf:
+        pth = dest.parent / ("%s-part%03d%s" % (dest.stem, part, dest.suffix))
+        _write_part(buf, pth)
+        output_paths.append(pth)
+
+    return CsvConversion(
+        cards=len(cards), rows=len(rows), output_paths=output_paths, warnings=warnings
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -2490,6 +2737,12 @@ def process_file(
     clean: bool = True,
     strip_patterns: Optional[List[str]] = None,
     used_llm: bool = False,
+    csv_list_min_segments: int = DEFAULT_CSV_LIST_MIN_SEGMENTS,
+    csv_list_max_segment_len: int = DEFAULT_CSV_LIST_MAX_SEGMENT_LEN,
+    csv_list_columns: Optional[List[str]] = None,
+    csv_skip_columns: Optional[List[str]] = None,
+    csv_title_column: Optional[str] = None,
+    split_bytes: Optional[int] = None,
 ) -> FileRecord:
     """Convert + validate a single file. Never raises — errors go in the record.
 
@@ -2573,6 +2826,28 @@ def process_file(
             output_format = "yaml" if mode_used == "yaml" else "markdown"
             if output_format == "yaml":
                 source_xml = src.read_text(encoding="utf-8", errors="replace")
+        elif fmt == "csv":
+            record.converter = "csv"
+            cc = convert_csv(
+                src, dest,
+                list_min_segments=csv_list_min_segments,
+                list_max_segment_len=csv_list_max_segment_len,
+                list_columns=csv_list_columns,
+                skip_columns=csv_skip_columns,
+                title_column=csv_title_column,
+                split_bytes=split_bytes,
+            )
+            for w in cc.warnings:
+                print("[csv] %s: warning — %s" % (src.name, w), file=sys.stderr)
+            parts = len(cc.output_paths)
+            struct: Dict[str, int] = {"cards": cc.cards, "rows": cc.rows}
+            if parts > 1:
+                struct["parts"] = parts
+            record.structural = struct
+            record.output_path = str(cc.output_paths[0]) if cc.output_paths else str(dest)
+            record.passed = cc.cards == cc.rows
+            record.status = "converted"
+            return record
         elif fmt == "doc-binary":
             raise RuntimeError(
                 "legacy binary .doc (OLE) needs LibreOffice/antiword; not supported. "
@@ -2758,6 +3033,12 @@ def run_batch(
     strip_patterns: Optional[List[str]] = None,
     used_llm: bool = False,
     deps: Optional[Dict[str, bool]] = None,
+    csv_list_min_segments: int = DEFAULT_CSV_LIST_MIN_SEGMENTS,
+    csv_list_max_segment_len: int = DEFAULT_CSV_LIST_MAX_SEGMENT_LEN,
+    csv_list_columns: Optional[List[str]] = None,
+    csv_skip_columns: Optional[List[str]] = None,
+    csv_title_column: Optional[str] = None,
+    split_bytes: Optional[int] = None,
 ) -> List[FileRecord]:
     """Convert + validate a file or every file under a directory, in parallel.
 
@@ -2800,6 +3081,12 @@ def run_batch(
                 clean=clean,
                 strip_patterns=strip_patterns,
                 used_llm=used_llm,
+                csv_list_min_segments=csv_list_min_segments,
+                csv_list_max_segment_len=csv_list_max_segment_len,
+                csv_list_columns=csv_list_columns,
+                csv_skip_columns=csv_skip_columns,
+                csv_title_column=csv_title_column,
+                split_bytes=split_bytes,
             ): f
             for f in files
         }
@@ -2926,6 +3213,42 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--preview-pages", type=int, default=DEFAULT_PREVIEW_PAGES,
         help="Pages to use with --preview (default: %d)" % DEFAULT_PREVIEW_PAGES,
     )
+
+    csv_grp = parser.add_argument_group("CSV options")
+    csv_grp.add_argument(
+        "--csv-list-min-segments", type=int, default=DEFAULT_CSV_LIST_MIN_SEGMENTS,
+        metavar="N",
+        help="Min comma-segments for a CSV column to be auto-detected as a list "
+        "(default: %d). Raise to be more conservative." % DEFAULT_CSV_LIST_MIN_SEGMENTS,
+    )
+    csv_grp.add_argument(
+        "--csv-list-max-segment-len", type=int, default=DEFAULT_CSV_LIST_MAX_SEGMENT_LEN,
+        metavar="L",
+        help="Max mean segment length (chars) to auto-detect a list column "
+        "(default: %d). Lower = stricter." % DEFAULT_CSV_LIST_MAX_SEGMENT_LEN,
+    )
+    csv_grp.add_argument(
+        "--csv-list-columns", default=None, metavar="COL,...",
+        help="Force these CSV columns to be expanded as bullet lists regardless of "
+        "the heuristic (comma-separated column names).",
+    )
+    csv_grp.add_argument(
+        "--csv-skip-columns", default=None, metavar="COL,...",
+        help="Omit these CSV columns from Markdown output entirely (comma-separated). "
+        "Use for redundant columns, e.g. a count column when the list itself is kept.",
+    )
+    csv_grp.add_argument(
+        "--csv-title-column", default=None, metavar="COL",
+        help="Column to use as the card heading (auto-detected if not set: prefers "
+        "columns named 'name'/'title', then first non-ID text column).",
+    )
+    csv_grp.add_argument(
+        "--split-file", default=None, metavar="SIZE",
+        help="Split CSV Markdown output into multiple files at card boundaries so "
+        "each file stays under SIZE (e.g. 3MB, 512K). Files are named "
+        "<stem>-part001.md, <stem>-part002.md, …",
+    )
+
     return parser.parse_args(argv)
 
 
@@ -3004,6 +3327,22 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     preview_pages = args.preview_pages if args.preview else None
 
+    csv_list_cols = (
+        [c.strip() for c in args.csv_list_columns.split(",")]
+        if args.csv_list_columns else None
+    )
+    csv_skip_cols = (
+        [c.strip() for c in args.csv_skip_columns.split(",")]
+        if args.csv_skip_columns else None
+    )
+    split_bytes: Optional[int] = None
+    if args.split_file:
+        try:
+            split_bytes = _parse_split_size(args.split_file)
+        except ValueError as exc:
+            print("error: --split-file: %s" % exc, file=sys.stderr)
+            return 2
+
     records = run_batch(
         input_path,
         output_dir,
@@ -3020,6 +3359,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         strip_patterns=args.strip_line,
         used_llm=used_llm,
         deps=deps,
+        csv_list_min_segments=args.csv_list_min_segments,
+        csv_list_max_segment_len=args.csv_list_max_segment_len,
+        csv_list_columns=csv_list_cols,
+        csv_skip_columns=csv_skip_cols,
+        csv_title_column=args.csv_title_column,
+        split_bytes=split_bytes,
     )
 
     report_path = write_report(records, output_dir)
