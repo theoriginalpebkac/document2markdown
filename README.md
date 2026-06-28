@@ -57,12 +57,13 @@ full agentic audit → re-extract loop) with whatever local backends you install
 automatically drop to `fast` — Docling's per-page table model would otherwise
 turn a multi-thousand-page doc into a near-hour run for little fidelity gain.
 OCR is skipped on born-digital PDFs (`--ocr auto`), since the text layer is
-already authoritative. PDF Markdown is also cleaned for LLM consumption by
-default (safe page-number/date furniture, empty duplicate tables, line-wrap
-token splits; add `--strip-line` for corpus-specific chrome) — every cleanup
-pass is verified lossless and falls back to the raw text if not, so cleaning
-never costs fidelity; use `--no-clean` for the raw extraction. No document is
-sent to a cloud service by default.
+already authoritative. Output Markdown is also cleaned for LLM consumption by
+default, per format — PDF (page-number/date furniture, empty duplicate tables,
+line-wrap token splits), MHTML (single-page-app chrome), docx/web (whitespace);
+add `--strip-line` for corpus-specific chrome. Every cleanup pass is verified
+lossless and falls back to the raw text if not, so cleaning never costs
+fidelity; use `--no-clean` for the raw extraction. No document is sent to a
+cloud service by default.
 
 For the occasional document local extraction can't handle, opt in to an LLM:
 
@@ -212,8 +213,8 @@ reprocess generated output.
 | `--llm {gemini,claude,openai,ollama}` | off | Enable LLM fallback for hard documents. |
 | `--llm-budget USD` | — | Per-document spend cap when `--llm` is set. |
 | `--no-figures` | off | Text-only Markdown (disable all image extraction). |
-| `--no-clean` | off (cleaning **on**) | Disable the default Markdown cleanup (PDF only): strips safe furniture (standalone page-number / date lines), drops empty duplicate tables, and repairs line-wrap token splits (e.g. `<a:b.ma x-c>` → `<a:b.max-c>`). Every pass is verified lossless by a non-whitespace character-conservation check and falls back to raw text if it can't be proven. Use `--no-clean` to keep the raw, true-to-source extraction. |
-| `--strip-line REGEX` | — | During cleanup, also remove lines that *fully* match REGEX — for document/corpus-specific header/footer chrome (company names, confidentiality notices, running titles) that can't be detected automatically. Repeatable. Still verified lossless. |
+| `--no-clean` | off (cleaning **on**) | Disable the default Markdown cleanup. Cleanup is per-format and verified lossless (falls back to raw if it can't be proven): **PDF** — safe page-number/date furniture, empty duplicate tables, line-wrap token-split repair (`<a:b.ma x-c>` → `<a:b.max-c>`); **MHTML** — single-page-app chrome (`data:` icon images, empty `div`/`span` scaffolding); **docx/web (pandoc)** — whitespace normalization + `--strip-line`. Use `--no-clean` for the raw, true-to-source extraction. |
+| `--strip-line REGEX` | — | During cleanup (any format), also remove lines that *fully* match REGEX — for document/corpus-specific header/footer chrome (company names, confidentiality notices, running titles) that can't be detected automatically. Repeatable. Still verified lossless. |
 | `--vector-diagrams` | off | Best-effort vector-diagram extraction (see caveat). |
 | `--figure-dpi N` | `150` | Render DPI for extracted PNGs. |
 | `--xml-mode {auto,verbatim,transform,yaml}` | `auto` | XML handling: `verbatim` (lossless fenced, for config), `transform` (structured Markdown, for doc-XML), `yaml` (structure-preserving `.yaml`), or auto-detect. |

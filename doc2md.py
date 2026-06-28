@@ -1112,8 +1112,15 @@ def convert_pdf(
     )
 
 
-def convert_with_pandoc(src: Path, dest: Path) -> str:
-    """Convert a non-PDF document to GFM Markdown with pandoc; return the text."""
+def convert_with_pandoc(
+    src: Path, dest: Path, *, clean: bool = True, strip_patterns: Optional[List[str]] = None
+) -> Tuple[str, Dict[str, object]]:
+    """Convert a non-PDF document to GFM Markdown with pandoc.
+
+    Returns ``(markdown, cleaning_stats)``. With ``clean`` (default) the safe
+    subset (:func:`clean_safe_subset` — whitespace + ``--strip-line``) is applied
+    and the cleaned text re-written to ``dest``.
+    """
     dest.parent.mkdir(parents=True, exist_ok=True)
     proc = subprocess.run(
         ["pandoc", "--to=gfm", "--output", str(dest), str(src)],
@@ -1124,7 +1131,12 @@ def convert_with_pandoc(src: Path, dest: Path) -> str:
         raise RuntimeError(
             "pandoc failed (exit %d): %s" % (proc.returncode, proc.stderr.strip())
         )
-    return dest.read_text(encoding="utf-8")
+    markdown = dest.read_text(encoding="utf-8")
+    cleaning: Dict[str, object] = {}
+    if clean:
+        markdown, cleaning = clean_safe_subset(markdown, strip_patterns=strip_patterns)
+        dest.write_text(markdown, encoding="utf-8")
+    return markdown, cleaning
 
 
 # --------------------------------------------------------------------------- #
@@ -1193,6 +1205,7 @@ class WordConversion:
     markdown: str
     images: int
     ref_plaintext: Optional[str]  # source text for the fidelity check
+    cleaning: Dict[str, object] = field(default_factory=dict)
 
 
 def _sniff_image(data: bytes) -> Optional[str]:
@@ -1352,9 +1365,12 @@ def html_to_markdown(html: str, have_pandoc: bool) -> str:
     return proc.stdout
 
 
-def _strip_pandoc_html_chrome(markdown: str) -> str:
+def _strip_pandoc_html_chrome(markdown: str, *, count: bool = False):
     """Remove non-content HTML that pandoc emits or passes through when
     converting single-page-app exports (Apple/Confluence MHTML, raw HTML).
+
+    With ``count=True`` returns ``(markdown, n_data_uri_imgs, n_tags_unwrapped)``
+    for cleanup stats; otherwise returns just the cleaned ``markdown``.
 
     Two kinds of noise bloat the output and tank the fidelity score (they are
     absent from the plaintext reference, so ``difflib`` penalizes them):
@@ -1367,15 +1383,15 @@ def _strip_pandoc_html_chrome(markdown: str) -> str:
       any inner text is kept, so content survives the unwrap.
     """
     # Drop inline-svg / data-URI images; keep real extracted-figure references.
-    markdown = re.sub(
+    markdown, n_imgs = re.subn(
         r"""<img\b[^>]*\bsrc\s*=\s*["']data:[^"']*["'][^>]*>""", "", markdown, flags=re.I
     )
     # Unwrap scaffolding tags (keep inner text); div/span carry no Markdown meaning.
-    markdown = re.sub(r"</?(?:div|span)\b[^>]*>", "", markdown, flags=re.I)
+    markdown, n_tags = re.subn(r"</?(?:div|span)\b[^>]*>", "", markdown, flags=re.I)
     # Collapse the blank-line runs and trailing spaces the removals leave behind.
     markdown = re.sub(r"[ \t]+$", "", markdown, flags=re.MULTILINE)
     markdown = re.sub(r"\n{3,}", "\n\n", markdown)
-    return markdown
+    return (markdown, n_imgs, n_tags) if count else markdown
 
 
 def convert_word(
@@ -1385,8 +1401,16 @@ def convert_word(
     *,
     have_pandoc: bool,
     visual_cfg: Optional[VisualConfig] = None,
+    clean: bool = True,
+    strip_patterns: Optional[List[str]] = None,
 ) -> WordConversion:
-    """Convert a Word-family document (OOXML ``.docx`` or Confluence MHTML)."""
+    """Convert a Word-family document (OOXML ``.docx`` or Confluence MHTML).
+
+    When ``clean`` (default), MHTML output is de-chromed via
+    :func:`clean_html_markdown` (visible-text-lossless) and ``.docx`` output gets
+    the :func:`clean_safe_subset` (whitespace + ``--strip-line``). ``--no-clean``
+    yields the raw pandoc conversion.
+    """
     cfg = visual_cfg or VisualConfig()
     slug = dest.stem
     fig_dir = dest.parent / slug / "figures"
@@ -1414,9 +1438,14 @@ def convert_word(
                 key_to_meta[key] = ("%s/%s" % (rel_base, fname), alt)
                 n += 1
         html = _rewrite_img_srcs(html, key_to_meta)
-        markdown = _strip_pandoc_html_chrome(html_to_markdown(html, have_pandoc))
+        markdown = html_to_markdown(html, have_pandoc)
+        cleaning: Dict[str, object] = {}
+        if clean:
+            markdown, cleaning = clean_html_markdown(markdown, strip_patterns=strip_patterns)
         dest.write_text(markdown, encoding="utf-8")
-        return WordConversion(markdown=markdown, images=n, ref_plaintext=ref_plaintext)
+        return WordConversion(
+            markdown=markdown, images=n, ref_plaintext=ref_plaintext, cleaning=cleaning
+        )
 
     if fmt == "docx":
         if not have_pandoc:
@@ -1438,8 +1467,13 @@ def convert_word(
             text=True,
         )
         ref_plaintext = ref.stdout if ref.returncode == 0 else None
+        cleaning = {}
+        if clean:
+            markdown, cleaning = clean_safe_subset(markdown, strip_patterns=strip_patterns)
         dest.write_text(markdown, encoding="utf-8")
-        return WordConversion(markdown=markdown, images=n, ref_plaintext=ref_plaintext)
+        return WordConversion(
+            markdown=markdown, images=n, ref_plaintext=ref_plaintext, cleaning=cleaning
+        )
 
     raise RuntimeError("unhandled Word format: %s" % fmt)
 
@@ -1879,20 +1913,47 @@ def _nonspace_counter(s: str):
     return Counter(ch for ch in s if not ch.isspace())
 
 
-def _compile_strip_patterns(strip_patterns: Optional[List[str]]):
-    """Safe built-in furniture patterns plus any user ``--strip-line`` regexes.
+def _visible_text_counter(s: str):
+    """Multiset of visible-text word tokens (HTML tags stripped).
 
-    Each user pattern is matched (``fullmatch``) against the *stripped* line, so
-    a pattern removes only lines it fully describes — never a substring of a
-    content line. Invalid regexes are skipped rather than aborting the run.
+    The fidelity unit for HTML-derived Markdown, whose cleanup deliberately
+    removes *markup* characters (tags, ``data:`` blobs). Comparing visible text
+    proves the rendered content is preserved even though markup chars are not.
     """
-    patterns = list(_SAFE_FURNITURE_PATTERNS)
+    from collections import Counter
+
+    return Counter(re.findall(r"\w+", _strip_html(s).lower()))
+
+
+def _compile_strip_patterns(strip_patterns: Optional[List[str]], *, include_safe: bool):
+    """Compile line-removal patterns: optional safe built-ins + user regexes.
+
+    ``include_safe`` adds the page-number/date :data:`_SAFE_FURNITURE_PATTERNS`
+    (PDF only — those are print chrome; on web/Word output a bare number is
+    likely content, so it's off there). Each pattern is matched (``fullmatch``)
+    against the *stripped* line, so it removes only lines it fully describes,
+    never a substring of content. Invalid regexes are skipped, not fatal.
+    """
+    patterns = list(_SAFE_FURNITURE_PATTERNS) if include_safe else []
     for p in strip_patterns or []:
         try:
             patterns.append(re.compile(p))
         except re.error:
             print("[clean] ignoring invalid --strip-line regex: %r" % p, file=sys.stderr)
     return patterns
+
+
+def _strip_lines_by_pattern(lines: List[str], patterns) -> Tuple[List[str], List[str]]:
+    """Split ``lines`` into (kept, removed) by full-line match against patterns."""
+    kept: List[str] = []
+    removed: List[str] = []
+    for ln in lines:
+        s = ln.strip()
+        if s and any(p.fullmatch(s) for p in patterns):
+            removed.append(ln)
+        else:
+            kept.append(ln)
+    return kept, removed
 
 
 def _drop_empty_tables(lines: List[str]) -> Tuple[List[str], List[str]]:
@@ -1995,6 +2056,7 @@ def clean_markdown(
     Markdown.
     """
     stats: Dict[str, object] = {
+        "kind": "pdf",
         "applied": False,
         "fell_back": False,
         "furniture_lines_removed": 0,
@@ -2004,15 +2066,8 @@ def clean_markdown(
         "furniture_samples": [],
     }
     try:
-        patterns = _compile_strip_patterns(strip_patterns)
-        removed: List[str] = []
-        kept: List[str] = []
-        for ln in md.split("\n"):
-            s = ln.strip()
-            if s and any(p.fullmatch(s) for p in patterns):
-                removed.append(ln)
-            else:
-                kept.append(ln)
+        patterns = _compile_strip_patterns(strip_patterns, include_safe=True)
+        kept, removed = _strip_lines_by_pattern(md.split("\n"), patterns)
         stats["furniture_lines_removed"] = len(removed)
         stats["furniture_samples"] = sorted({r.strip() for r in removed})[:15]
 
@@ -2033,6 +2088,93 @@ def clean_markdown(
 
         stats["xml_tag_joins"] = n_xml
         stats["cell_dehyphenations"] = n_cell
+        stats["applied"] = True
+        return cleaned, stats
+    except Exception as exc:  # pragma: no cover - cleanup must never break a run
+        stats["fell_back"] = True
+        stats["error"] = str(exc)
+        return md, stats
+
+
+def clean_html_markdown(
+    md: str, *, strip_patterns: Optional[List[str]] = None
+) -> Tuple[str, Dict[str, object]]:
+    """Clean Markdown converted from HTML/MHTML (SPA exports) for LLM use.
+
+    Removes single-page-app chrome that pandoc passes through (:func:
+    `_strip_pandoc_html_chrome`: ``data:`` icon images, empty ``div``/``span``
+    scaffolding) and any user ``--strip-line`` lines. Unlike the PDF cleaner it
+    does *not* strip bare-number/date lines (on web content those are usually
+    real) and has no token-split repairs.
+
+    Fidelity is proven at the *visible-text* level (:func:`_visible_text_counter`)
+    rather than character level, because the transforms intentionally drop markup
+    characters: the rendered text must be conserved (output + audited removals).
+    Falls back to the raw Markdown if it can't be shown.
+    """
+    stats: Dict[str, object] = {
+        "kind": "html",
+        "applied": False,
+        "fell_back": False,
+        "furniture_lines_removed": 0,
+        "chrome_imgs_removed": 0,
+        "tags_unwrapped": 0,
+        "furniture_samples": [],
+    }
+    try:
+        patterns = _compile_strip_patterns(strip_patterns, include_safe=False)
+        kept, removed = _strip_lines_by_pattern(md.split("\n"), patterns)
+        stats["furniture_lines_removed"] = len(removed)
+        stats["furniture_samples"] = sorted({r.strip() for r in removed})[:15]
+
+        text, n_imgs, n_tags = _strip_pandoc_html_chrome("\n".join(kept), count=True)
+        cleaned = _collapse_blank_runs(text)
+
+        # Fidelity gate: visible *body* text (between tags) is preserved —
+        # chrome-strip removes only markup and decorative ``data:`` icon images.
+        # Note: an icon's alt attribute lives inside the tag and so isn't covered
+        # by this text-level check; that matches the established behavior (these
+        # are decorative inline icons — real file-path figures are never removed),
+        # modulo the audited --strip-line removals.
+        if _visible_text_counter(md) != _visible_text_counter(cleaned) + _visible_text_counter("\n".join(removed)):
+            stats["fell_back"] = True
+            return md, stats
+
+        stats["chrome_imgs_removed"] = n_imgs
+        stats["tags_unwrapped"] = n_tags
+        stats["applied"] = True
+        return cleaned, stats
+    except Exception as exc:  # pragma: no cover - cleanup must never break a run
+        stats["fell_back"] = True
+        stats["error"] = str(exc)
+        return md, stats
+
+
+def clean_safe_subset(
+    md: str, *, strip_patterns: Optional[List[str]] = None
+) -> Tuple[str, Dict[str, object]]:
+    """Format-agnostic safe cleanup for docx / pandoc Markdown.
+
+    Only the universally-safe operations: drop user ``--strip-line`` lines and
+    collapse trailing/blank whitespace. No PDF furniture/repairs, no HTML
+    chrome-stripping. Character-conservation-gated; falls back to raw on doubt.
+    """
+    stats: Dict[str, object] = {
+        "kind": "safe",
+        "applied": False,
+        "fell_back": False,
+        "furniture_lines_removed": 0,
+        "furniture_samples": [],
+    }
+    try:
+        patterns = _compile_strip_patterns(strip_patterns, include_safe=False)
+        kept, removed = _strip_lines_by_pattern(md.split("\n"), patterns)
+        cleaned = _collapse_blank_runs("\n".join(kept))
+        if _nonspace_counter(md) != _nonspace_counter(cleaned) + _nonspace_counter("\n".join(removed)):
+            stats["fell_back"] = True
+            return md, stats
+        stats["furniture_lines_removed"] = len(removed)
+        stats["furniture_samples"] = sorted({r.strip() for r in removed})[:15]
         stats["applied"] = True
         return cleaned, stats
     except Exception as exc:  # pragma: no cover - cleanup must never break a run
@@ -2267,7 +2409,7 @@ def _note_auto_decision(
 
 
 def _report_cleaning(record: FileRecord) -> None:
-    """Echo a one-line cleanup summary (and any lossless-fallback) for a PDF."""
+    """Echo a one-line cleanup summary (and any lossless-fallback), per kind."""
     c = record.cleaning
     if not c:
         return
@@ -2277,19 +2419,29 @@ def _report_cleaning(record: FileRecord) -> None:
             % record.filename,
             file=sys.stderr,
         )
-    if c.get("applied"):
-        print(
-            "[clean] %s: -%d furniture lines, -%d empty-table rows, "
-            "%d tag-splits + %d cell-splits repaired (lossless verified)"
+    if not c.get("applied"):
+        return
+    kind = c.get("kind")
+    n_furn = int(c.get("furniture_lines_removed", 0))
+    if kind == "pdf":
+        detail = (
+            "-%d furniture lines, -%d empty-table rows, %d tag-splits + %d cell-splits repaired"
             % (
-                record.filename,
-                int(c.get("furniture_lines_removed", 0)),
+                n_furn,
                 int(c.get("empty_table_rows_removed", 0)),
                 int(c.get("xml_tag_joins", 0)),
                 int(c.get("cell_dehyphenations", 0)),
-            ),
-            file=sys.stderr,
+            )
         )
+    elif kind == "html":
+        detail = "-%d data-URI icons, -%d scaffolding tags, -%d --strip-line" % (
+            int(c.get("chrome_imgs_removed", 0)),
+            int(c.get("tags_unwrapped", 0)),
+            n_furn,
+        )
+    else:  # safe subset (docx / pandoc)
+        detail = "-%d --strip-line lines, whitespace normalized" % n_furn
+    print("[clean] %s: %s (lossless verified)" % (record.filename, detail), file=sys.stderr)
 
 
 def process_file(
@@ -2371,11 +2523,14 @@ def process_file(
         elif fmt in ("mhtml", "docx"):
             record.converter = "mhtml" if fmt == "mhtml" else "pandoc(docx)"
             wc = convert_word(
-                src, dest, fmt, have_pandoc=bool(deps.get("pandoc")), visual_cfg=visual_cfg
+                src, dest, fmt, have_pandoc=bool(deps.get("pandoc")), visual_cfg=visual_cfg,
+                clean=clean, strip_patterns=strip_patterns,
             )
             markdown = wc.markdown
             original_plaintext = wc.ref_plaintext
             record.figures = {"diagrams": 0, "images": wc.images, "complex_tables": 0}
+            record.cleaning = wc.cleaning
+            _report_cleaning(record)
         elif fmt == "xml":
             markdown, mode_used, dest = convert_xml(src, dest, mode=xml_mode)
             record.converter = "xml-%s" % mode_used
@@ -2398,7 +2553,11 @@ def process_file(
             if not deps.get("pandoc"):
                 raise RuntimeError("pandoc is not installed; cannot convert %s" % src.suffix)
             record.converter = "pandoc"
-            markdown = convert_with_pandoc(src, dest)
+            markdown, cleaning = convert_with_pandoc(
+                src, dest, clean=clean, strip_patterns=strip_patterns
+            )
+            record.cleaning = cleaning
+            _report_cleaning(record)
 
         record.output_path = str(dest)
         # Web (MHTML) fidelity is noisier than PDF/DOCX; cap its bar at the web
@@ -2691,15 +2850,16 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--no-clean", action="store_true",
-        help="Disable the default Markdown cleanup (PDF only). By default doc2md "
-        "strips safe furniture (bare page numbers / dates), drops empty duplicate "
-        "tables, and repairs line-wrap token splits — all verified lossless (it "
-        "falls back to raw text if not). Use this to keep the raw extraction.",
+        help="Disable the default Markdown cleanup. By default doc2md cleans per "
+        "format — PDF: safe page-number/date furniture, empty duplicate tables, "
+        "line-wrap token-split repair; MHTML: single-page-app chrome (data-URI "
+        "icons, div/span scaffolding); docx/web: whitespace + --strip-line — each "
+        "verified lossless (falls back to raw if not). Use this for raw output.",
     )
     parser.add_argument(
         "--strip-line", action="append", metavar="REGEX", default=None,
-        help="Remove lines that fully match REGEX during cleanup — for "
-        "document/corpus-specific header/footer chrome that can't be detected "
+        help="Remove lines that fully match REGEX during cleanup (all formats) — "
+        "for document/corpus-specific header/footer chrome that can't be detected "
         "automatically (e.g. 'Acme Corp, Inc\\.', 'Confidential.*'). Repeatable. "
         "Matched against the whole stripped line; still verified lossless.",
     )
