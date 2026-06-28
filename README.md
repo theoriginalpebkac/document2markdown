@@ -204,8 +204,8 @@ reprocess generated output.
 | Option | Default | Description |
 | --- | --- | --- |
 | `-w`, `--workers N` | `4` | Parallel worker count. |
-| `-t`, `--threshold R` | `0.90` | Minimum text-similarity ratio to pass validation. Web (MHTML) exports are capped at a relaxed `0.80` bar, since SPA chrome and per-token code markup make their character-diff inherently noisier than PDF/DOCX. |
-| `--min-confidence R` | `0.70` | Minimum pdfmux confidence to pass. When confidence clears this bar, a low text-similarity score is reported but no longer fails the document — `pdftotext` is only a flat cross-check and mangles multi-column/tabular PDFs, so a faithful conversion can score low. |
+| `-t`, `--threshold R` | `0.90` | Minimum ordered text-similarity ratio to pass validation. Web (MHTML) exports are capped at a relaxed `0.80` bar, since SPA chrome and per-token code markup make their character-diff inherently noisier than PDF/DOCX. |
+| `--min-confidence R` | `0.70` | Minimum pdfmux confidence to pass. A low ordered-similarity score is reported but **not fatal** when either pdfmux confidence clears this bar *or* order-insensitive **content recall** (≥ 0.90 of the source's word tokens present) is high. The ordered char-diff tanks on faithful conversions that reflow content — tabular/multi-column PDFs (where `pdftotext` itself splits words at line-wraps) and HTML→Markdown (Confluence/Apple MHTML) — so recall lets a content-complete conversion pass while genuine loss (low recall too) still fails. |
 | `-q`, `--quality {auto,fast,standard,high}` | `auto` | Local extraction quality. `auto` uses `standard` (max local effort) but drops to `fast` for very large PDFs (see `--large-doc-pages`), where Docling's per-page table model isn't worth the time. `fast` = PyMuPDF only. |
 | `--large-doc-pages N` | `1000` | With `--quality=auto`, PDFs larger than N pages use `fast` instead of `standard`. |
 | `--ocr {auto,on,off}` | `auto` | OCR control for PDF extraction. `auto` skips OCR on born-digital PDFs (much faster, no fidelity loss — the text layer is authoritative) and keeps it for scanned/image PDFs. `on` forces it; `off` disables it. |

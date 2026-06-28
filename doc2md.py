@@ -90,6 +90,11 @@ DEFAULT_SIMILARITY_THRESHOLD = 0.90
 # the character-diff fidelity check is inherently noisier than for PDF/DOCX even
 # when the prose is faithful. Hold them to a relaxed bar instead of 0.90.
 DEFAULT_WEB_SIMILARITY_THRESHOLD = 0.80
+# Order-insensitive content-recall bar. The ordered char-diff (above) tanks on
+# faithful conversions that legitimately reflow content (tabular PDFs, HTML→MD),
+# so a doc also passes fidelity if it preserves at least this share of the
+# source's word tokens — caught only when there's no confident extractor signal.
+DEFAULT_CONTAINMENT_THRESHOLD = 0.90
 DEFAULT_MIN_CONFIDENCE = 0.70
 DEFAULT_PREVIEW_PAGES = 3
 DEFAULT_FIGURE_DPI = 150
@@ -223,6 +228,7 @@ class FileRecord:
     output_path: Optional[str] = None
     similarity: Optional[float] = None
     similarity_method: Optional[str] = None  # "sequence" (difflib) | "containment"
+    content_recall: Optional[float] = None  # order-insensitive token recall
     pdfmux_confidence: Optional[float] = None
     min_page_confidence: Optional[float] = None
     structural: Dict[str, int] = field(default_factory=dict)
@@ -1844,13 +1850,19 @@ _SIMILARITY_SEQUENCE_MAX_CHARS = 200_000
 def _containment_ratio(original_text: str, markdown_text: str) -> float:
     """O(n) token recall: fraction of the source's word tokens present in the md.
 
-    Order-insensitive, so it isn't fooled by the layout reflow that tanks
-    difflib on multi-column/tabular PDFs, and it's linear instead of quadratic.
+    Order-insensitive, so it isn't fooled by layout reflow (multi-column/tabular
+    PDFs) or by HTML→Markdown reordering, and it's linear, not quadratic.
+
+    Tokenizes both sides with a plain ``\\w+`` pattern and *no* markup stripping:
+    that pulls the words out of inline-tag / code content alike (``<assign:var>``
+    -> ``assign``, ``var``), so docs whose body is XML/code examples — which
+    ``strip_markdown`` would wrongly delete as tags — are scored on real content.
+    Extra tokens the Markdown adds (link URLs, etc.) don't affect recall.
     """
     from collections import Counter
 
     src = Counter(re.findall(r"\w+", original_text.lower()))
-    out = Counter(re.findall(r"\w+", strip_markdown(markdown_text).lower()))
+    out = Counter(re.findall(r"\w+", markdown_text.lower()))
     total = sum(src.values())
     if total == 0:
         return 1.0
@@ -2277,6 +2289,7 @@ def validate(
     original_plaintext: Optional[str],
     *,
     similarity_threshold: float = DEFAULT_SIMILARITY_THRESHOLD,
+    containment_threshold: float = DEFAULT_CONTAINMENT_THRESHOLD,
     confidence: Optional[float] = None,
     min_confidence: float = DEFAULT_MIN_CONFIDENCE,
     output_format: str = "markdown",
@@ -2288,12 +2301,16 @@ def validate(
     in which case the similarity check is skipped. ``confidence`` is pdfmux's
     document confidence (PDF only); below ``min_confidence`` fails the document.
 
-    Low pdftotext similarity is only a *hard* failure when there's no confident
-    extractor signal: pdftotext is a flat cross-check, not ground truth, and it
-    mangles multi-column/tabular PDFs (splitting words at line-wraps), so a
-    faithful pdfmux conversion can score low. When pdfmux confidence is high the
-    score is still reported (``similarity_ok``) but not fatal. Non-PDF inputs
-    carry no confidence, so similarity remains their gate.
+    A low ordered similarity is only a *hard* failure when neither fallback
+    signal vouches for the conversion: the char-diff is a flat cross-check, not
+    ground truth, and it tanks whenever content is faithfully *reflowed* —
+    tabular/multi-column PDFs (pdftotext also splits words at line-wraps) and
+    HTML→Markdown (Confluence/Apple MHTML). So the document still passes if
+    either pdfmux **confidence** is high *or* order-insensitive **content
+    recall** (``content_recall`` ≥ ``containment_threshold``) is high; the low
+    score stays visible (``similarity_ok``) for the report. This is what lets a
+    faithful, content-complete MHTML/web conversion pass despite a low char-diff,
+    while genuine content loss (low recall too) still fails.
 
     Structural emptiness (a long document with no headings/tables/code/figures)
     is only a *hard* failure when we have no fidelity signal — if text
@@ -2321,9 +2338,19 @@ def validate(
     similarity: Optional[float] = None
     sim_ok: Optional[bool] = None
     sim_method: Optional[str] = None
+    content_recall: Optional[float] = None
+    content_ok: Optional[bool] = None
     if original_plaintext is not None:
         similarity, sim_method = compute_similarity(original_plaintext, markdown)
         sim_ok = similarity >= similarity_threshold
+        # Order-insensitive content recall as a second fidelity signal (reuse the
+        # primary score when it already is containment, for huge docs).
+        content_recall = (
+            similarity
+            if sim_method == "containment"
+            else _containment_ratio(original_plaintext, markdown)
+        )
+        content_ok = content_recall >= containment_threshold
 
     conf_ok: Optional[bool] = None
     if confidence is not None:
@@ -2331,14 +2358,15 @@ def validate(
 
     # Structural emptiness is fatal only when fidelity is otherwise unverifiable.
     struct_fatal = (not struct_ok) and (sim_ok is None)
-    # Low pdftotext similarity is fatal only when we lack a confident extractor
-    # signal. pdftotext is a flat cross-check, not ground truth: on multi-column
-    # / tabular PDFs it shatters words at line-wraps (e.g. "configuration" ->
-    # "config" + "uration"), so a faithful (often cleaner) pdfmux conversion can
-    # score low. When pdfmux reports high confidence we keep the score visible
-    # (similarity_ok=False) but don't fail on it. Non-PDF inputs have no
-    # confidence, so similarity still gates them.
-    sim_fatal = (sim_ok is False) and (conf_ok is not True)
+    # A low ordered similarity is fatal only when *both* fallback signals also
+    # fail. The ordered char-diff is a flat cross-check, not ground truth: it
+    # tanks on faithful conversions that reflow content — tabular/multi-column
+    # PDFs (where pdftotext also shatters words at line-wraps, "configuration" ->
+    # "config" + "uration") and HTML->Markdown (Confluence/Apple MHTML), whose
+    # XML/code examples and chrome removal reorder text. So we don't fail when
+    # either a confident extractor signal (pdfmux) OR high order-insensitive
+    # content recall vouches for it; the low score stays visible in the report.
+    sim_fatal = (sim_ok is False) and (conf_ok is not True) and (content_ok is not True)
     passed = (
         (not sim_fatal)
         and (conf_ok is not False)
@@ -2350,6 +2378,7 @@ def validate(
         "similarity": similarity,
         "similarity_method": sim_method,
         "similarity_ok": sim_ok,
+        "content_recall": content_recall,
         "confidence_ok": conf_ok,
         "structural": counts,
         "structural_ok": struct_ok,
@@ -2576,6 +2605,7 @@ def process_file(
         )
         record.similarity = result["similarity"]  # type: ignore[assignment]
         record.similarity_method = result["similarity_method"]  # type: ignore[assignment]
+        record.content_recall = result["content_recall"]  # type: ignore[assignment]
         record.similarity_ok = result["similarity_ok"]  # type: ignore[assignment]
         record.confidence_ok = result["confidence_ok"]  # type: ignore[assignment]
         record.structural = result["structural"]  # type: ignore[assignment]
@@ -2662,7 +2692,8 @@ def print_summary(records: List[FileRecord], top_n: int = 10) -> None:
             flag = "FAIL" if r.passed is False else "ok"
             conf = "" if r.pdfmux_confidence is None else " conf=%.2f" % r.pdfmux_confidence
             method = " (%s)" % r.similarity_method if r.similarity_method == "containment" else ""
-            print("  %-6s %.3f%s%s  %s" % (flag, r.similarity, conf, method, r.filename))
+            recall = "" if r.content_recall is None else " recall=%.2f" % r.content_recall
+            print("  %-6s %.3f%s%s%s  %s" % (flag, r.similarity, conf, method, recall, r.filename))
 
     for r in failed:
         reasons = []
