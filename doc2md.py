@@ -1766,7 +1766,16 @@ def _yaml_breadcrumbs(text: str, min_depth: int = 2, sep: str = " > ") -> str:
         return sep.join(segs)
 
     out: List[str] = []
+    # Index up to which lines are the verbatim body of a literal/folded block
+    # scalar (``|``/``>``) already emitted by the opener below. Their interior is
+    # arbitrary text — a line like ``Possible values are:`` must NOT be mistaken
+    # for a mapping key, or a breadcrumb would be injected into the string value
+    # and corrupt the round-trip. So we pass block-scalar bodies through untouched.
+    skip_to = -1
     for i, line in enumerate(lines):
+        if i < skip_to:
+            out.append(line)
+            continue
         if not line.strip():
             out.append(line)
             continue
@@ -1792,6 +1801,24 @@ def _yaml_breadcrumbs(text: str, min_depth: int = 2, sep: str = " > ") -> str:
         m = re.match(r"^(.*?):(?:\s+(.*))?$", content)
         key = m.group(1) if m else None
         val = m.group(2) if m else None
+
+        # A block-scalar opener introduces literal text whose body is indented
+        # deeper than this line. It appears either as ``key: |`` (mapping value) or
+        # as a bare ``- |-`` list item; in both forms the style indicator is the
+        # only token. Emit the opener, then pass its whole body through verbatim.
+        if key is None:
+            scalar = content
+        elif val is not None:
+            scalar = val
+        else:
+            scalar = None
+        if scalar is not None and re.match(r"^[|>][0-9+-]*\s*$", scalar):
+            j = i + 1
+            while j < len(lines) and (not lines[j].strip() or _indent(lines[j]) > col):
+                j += 1
+            skip_to = j
+            out.append(line)
+            continue
 
         # Block detection: empty inline value AND the next line is deeper, or a
         # dash at the same column (PyYAML lists sit at the owning key's indent).
