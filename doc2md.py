@@ -960,47 +960,64 @@ def build_markdown_with_visuals(
     doc_title: str,
     mark_pages: bool = False,
 ) -> Tuple[str, List[Visual]]:
-    """Interleave pdfmux per-page text with inline visual blocks for that page.
+    """Combine pdfmux text with extracted visual blocks, keeping figures near
+    their page's context.
 
-    ``pages_text`` is ``[(page_index, markdown_text), ...]`` from pdfmux. Figures
-    land directly after the text of the page they came from, keeping them near
-    their context for RAG. PNGs go in ``<slug>/figures/`` next to the .md, named
-    ``<slug>-pNNN-<kind>NN.png`` (slug = the .md stem). ``doc_title`` is the
-    original document name, used in figure alt text. With ``mark_pages`` a
-    ``<!-- doc2md:page=N -->`` marker is woven in at every page boundary (see
-    :func:`_assemble_with_page_markers`) — independent of figure extraction, so
-    page provenance is emitted even under ``--no-figures``.
+    Visual extraction runs over the PDF's **real page range** (PyMuPDF owns page
+    geometry), *independent* of how pdfmux segmented the text — so figures on
+    every page are captured, not just those on the one page that happens to align
+    with a text unit. PNGs go in ``<slug>/figures/`` next to the .md, named
+    ``<slug>-pNNN-<kind>NN.png``. ``doc_title`` is used in figure alt text.
+
+    Placement depends on whether pdfmux gave us **per-page text**:
+
+    * Per-page (``len(pages_text) > 1``): each page's visuals are interleaved
+      right after that page's text, and — with ``mark_pages`` — a
+      ``<!-- doc2md:page=N -->`` marker is woven in at every page boundary.
+    * Single combined blob: there is no per-page anchor to interleave into, so
+      visuals are appended **grouped by page** under a heading at the end of the
+      document. Provenance survives via each block's ``[Figure — p.N]`` label and
+      page-stamped alt text; only inline placement is degraded, and that
+      self-heals once pdfmux exposes per-page text again. Page markers are
+      suppressed here for the same reason (a lone ``page=1`` would mislead).
     """
     visuals_enabled = cfg.enabled and pymupdf is not None
-    # Page markers need genuine per-page segmentation. Some pdfmux versions
-    # surface only a single combined text blob (no per-page split) even for a
-    # multi-page PDF — emitting a lone "page=1" marker there would be misleading,
-    # so only mark when we actually have more than one page unit to delimit.
-    mark_pages = mark_pages and len(pages_text) > 1
+    have_per_page_text = len(pages_text) > 1
+    mark_pages = mark_pages and have_per_page_text
 
     slug = dest.stem  # already slugified by _output_path_for
     fig_dir = dest.parent / slug / "figures"
     rel_base = "%s/figures" % slug
 
     visuals_all: List[Visual] = []
-    units: List[Tuple[int, str, str]] = []
+    visual_md_by_page: Dict[int, str] = {}
     doc = pymupdf.open(str(pdf_path)) if visuals_enabled else None
     try:
-        for page_index, text in pages_text:
-            visual_md = ""
-            if doc is not None and 0 <= page_index < doc.page_count:
+        if doc is not None:
+            for page_index in range(doc.page_count):
                 vis = extract_page_visuals(
                     doc[page_index], page_index, fig_dir, rel_base, slug, doc_title, cfg
                 )
                 if vis:
-                    visual_md = render_visual_markdown(vis)
+                    visual_md_by_page[page_index] = render_visual_markdown(vis)
                     visuals_all.extend(vis)
-            units.append((page_index, text or "", visual_md))
     finally:
         if doc is not None:
             doc.close()
 
-    return _assemble_with_page_markers(units, mark_pages), visuals_all
+    if have_per_page_text:
+        units = [
+            (idx, text or "", visual_md_by_page.get(idx, "")) for idx, text in pages_text
+        ]
+        return _assemble_with_page_markers(units, mark_pages), visuals_all
+
+    # Single combined blob: emit the text, then append page-ordered visual blocks.
+    blob = "\n\n".join(t for _, t in pages_text if t and t.strip())
+    grouped = [visual_md_by_page[i] for i in sorted(visual_md_by_page)]
+    if not grouped:
+        return blob, visuals_all
+    parts = ([blob] if blob else []) + ["## Figures & tables (by page)"] + grouped
+    return "\n\n".join(parts), visuals_all
 
 
 # --------------------------------------------------------------------------- #
