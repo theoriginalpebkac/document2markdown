@@ -44,7 +44,7 @@ so they can be imported and unit-tested on their own.
 | **`.docx`** (Word, Google Docs) | [pandoc](https://pandoc.org/) (`--extract-media`) | semantic structure + embedded images |
 | **Confluence "Word" export** (MHTML, usually `.doc`) | extract HTML + base64 images (stdlib) → pandoc | images recovered & inlined; UI icons filtered |
 | **Config XML** (syntax-critical) | **verbatim** — fenced ```xml``` + generated index | lossless; exact tags/attributes/values preserved |
-| **Config XML → YAML** (opt-in `--yaml`) | structure-preserving YAML (`.yaml`) | lower-token grounding for LLMs; round-trip-verified against the source XML |
+| **Config XML → YAML** (opt-in `--yaml`) | structure-preserving YAML (`.yaml`) | lower-token grounding for LLMs; round-trip-verified against the source XML; add `--yaml-index` for RAG-locatable breadcrumbs |
 | **Documentation XML** | **transform** — structured Markdown (headings/lists) | for XML that is really a document |
 | HTML / EPUB / RTF / ODT | pandoc | |
 | legacy binary `.doc` (OLE) | — | not supported; re-save as `.docx` or export PDF |
@@ -104,6 +104,17 @@ export of a given document:
     and the DOCTYPE are dropped. Best for config-style XML;
     documentation-style XML (prose with mid-sentence inline tags) reads better as
     Markdown — leave `--yaml` off for those.
+  - For **RAG** ingestion of large, deeply-nested config (e.g. NotebookLM), add
+    **`--yaml-index`** (implies `--yaml`). RAG systems retrieve by similarity over
+    *chunks*, not by reading the whole file, so a deeply-nested block is retrieved
+    stripped of its ancestor keys and can't be located. `--yaml-index` prefixes
+    every block with a `# path: a > b(@value=…) > c` structural breadcrumb, so
+    each chunk carries its own location and the path tokens help match
+    natural-language queries. The breadcrumbs are YAML comments (dropped on parse),
+    so fidelity is unchanged — the indexed output minus the `# path:` lines is the
+    plain `--yaml` output. Long plain scalars (e.g. space-separated IP/CIDR lists)
+    are also kept on a single line, since the multi-line plain scalars that
+    default line-wrapping produces trip up strict/lightweight YAML parsers.
 
 ### Figure & table extraction
 
@@ -219,6 +230,7 @@ reprocess generated output.
 | `--figure-dpi N` | `150` | Render DPI for extracted PNGs. |
 | `--xml-mode {auto,verbatim,transform,yaml}` | `auto` | XML handling: `verbatim` (lossless fenced, for config), `transform` (structured Markdown, for doc-XML), `yaml` (structure-preserving `.yaml`), or auto-detect. |
 | `--yaml` | off | Shorthand for `--xml-mode=yaml`: emit XML as YAML (`.yaml`) — fewer tokens than Markdown, round-trip-verified to the source. XML inputs only; takes precedence over `--xml-mode`. |
+| `--yaml-index` | off | Implies `--yaml`, and prefixes each nested block with a `# path: …` structural breadcrumb so RAG ingesters (e.g. NotebookLM) can locate deeply-nested blocks. Comments don't change the parsed data, so round-trip fidelity is unaffected. |
 | `--preview` | off | Process only the first few pages of each PDF (quick sanity check). |
 | `--preview-pages N` | `3` | Pages to use with `--preview`. |
 
@@ -239,6 +251,9 @@ python3 doc2md.py ./docs --preview
 
 # Config XML → low-token YAML for LLM grounding (verified lossless)
 python3 doc2md.py ./configs --yaml
+
+# Same, with structural-path breadcrumbs for RAG retrieval (e.g. NotebookLM)
+python3 doc2md.py ./configs --yaml-index
 
 # Diagram-centric corpus, higher-res figures
 python3 doc2md.py ./docs --vector-diagrams --figure-dpi 200
