@@ -74,7 +74,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 try:
     import pymupdf  # PyMuPDF >= 1.24
@@ -1716,7 +1716,116 @@ def _xml_comments_to_elements(raw: str, tag: str = "_comment") -> str:
     return "".join(out)
 
 
-def xml_to_yaml(raw: str) -> str:
+_YAML_DISC_KEYS = ("'@value'", "'@name'", "'@result'", "'@field'", "name")
+
+
+def _yaml_breadcrumbs(text: str, min_depth: int = 2, sep: str = " > ") -> str:
+    """Insert ``# path: a > b > c`` breadcrumb comments into dumped YAML.
+
+    RAG ingesters (NotebookLM and friends) retrieve by embedding similarity over
+    *chunks*, not by reading the whole document — so a deeply-nested block like
+    ``forward:cache-parent`` is retrieved stripped of its ancestor keys and the
+    model can't tell what it is or where it lives (it "looks in the wrong place").
+    Prepending each block with its structural path restores that context inside
+    whatever chunk the block lands in, and the path text adds natural-language
+    tokens that bridge the prose-query ↔ config-key vocabulary gap.
+
+    Each path segment carries the node's discriminating attribute
+    (``@value``/``@name``/``@result``/``@field``/``name``) when present, because
+    config XML repeats keys constantly (``match:request.type`` etc.) and a bare
+    key-path would collide across the document.
+
+    Pure structural derivation: no free-text is read from the data, so it never
+    picks up junk (unlike comment-derived labels). Breadcrumbs are YAML comments,
+    dropped on parse — so structural/fidelity round-tripping is unaffected.
+
+    Operates on the PyYAML text dumped by :func:`xml_to_yaml` (2-space indent).
+    PyYAML dumps list items at the SAME indent as their owning key with content
+    at +2; the list owner frame holds a discriminator that resets on each ``-``
+    so successive items don't leak each other's identity.
+    """
+    lines = text.split("\n")
+    # indent of the next non-blank line, used to tell a block from a leaf scalar
+    nb_next: List[Optional[int]] = [None] * len(lines)
+    nxt: Optional[int] = None
+    for i in range(len(lines) - 1, -1, -1):
+        nb_next[i] = nxt
+        if lines[i].strip():
+            nxt = i
+
+    def _indent(s: str) -> int:
+        return len(s) - len(s.lstrip(" "))
+
+    stack: List[Dict[str, Any]] = []  # frames: col, label, disc, kind(map|list)
+
+    def path_str() -> str:
+        segs = []
+        for f in stack:
+            seg = f["label"] + ("(%s)" % f["disc"] if f["disc"] else "")
+            segs.append(seg)
+        return sep.join(segs)
+
+    out: List[str] = []
+    for i, line in enumerate(lines):
+        if not line.strip():
+            out.append(line)
+            continue
+
+        col = _indent(line)
+        body = line[col:]
+        is_dash = body.startswith("- ")
+        content = body[2:] if is_dash else body
+        kcol = col + 2 if is_dash else col  # column the key text starts at
+
+        if is_dash:
+            # Pop frames deeper than this list level and any prior item's
+            # leftover map frames; stop at the owning list frame (col == col).
+            while stack and (stack[-1]["col"] > col or
+                             (stack[-1]["col"] == col and stack[-1]["kind"] != "list")):
+                stack.pop()
+            if stack and stack[-1]["col"] == col and stack[-1]["kind"] == "list":
+                stack[-1]["disc"] = None  # new item -> reset owner discriminator
+        else:
+            while stack and stack[-1]["col"] >= kcol:
+                stack.pop()
+
+        m = re.match(r"^(.*?):(?:\s+(.*))?$", content)
+        key = m.group(1) if m else None
+        val = m.group(2) if m else None
+
+        # Block detection: empty inline value AND the next line is deeper, or a
+        # dash at the same column (PyYAML lists sit at the owning key's indent).
+        opens_block = is_list = False
+        if key is not None and (val is None or val == ""):
+            j = nb_next[i]
+            if j is not None:
+                jc = _indent(lines[j])
+                jdash = lines[j][jc:].startswith("- ")
+                if jc > kcol:
+                    opens_block = True
+                elif jdash and jc == kcol:
+                    opens_block = is_list = True
+
+        # Discriminator capture: an inline @value/@name/etc. scalar describes the
+        # frame it sits in (current top — a map block, or a list owner mid-item).
+        if key in _YAML_DISC_KEYS and val not in (None, "") and stack \
+                and not stack[-1]["disc"]:
+            stack[-1]["disc"] = "%s=%s" % (key.strip("'"), val.strip("'"))
+
+        if opens_block and key is not None:
+            if len(stack) + 1 >= min_depth:
+                bc = path_str()
+                full = bc + (sep if bc else "") + key
+                out.append("%s# path: %s" % (" " * col, full))
+            stack.append({"col": kcol, "label": key, "disc": None,
+                          "kind": "list" if is_list else "map"})
+
+        out.append(line)
+
+    return "\n".join(out)
+
+
+def xml_to_yaml(raw: str, index: bool = False) -> str:
     """Convert XML to YAML (structure-preserving, low-token, no Markdown wrapper).
 
     Uses ``xmltodict`` to build a dict — attributes become ``@name`` keys, element
@@ -1731,6 +1840,10 @@ def xml_to_yaml(raw: str) -> str:
     ``xmltodict``'s by-key grouping. Processing instructions and the DOCTYPE are
     still dropped. Mixed prose+inline-tag content is awkward, so this is *not* used
     for documentation-style XML.
+
+    When ``index`` is set (``--yaml-index``), each nested block is prefixed with a
+    ``# path: ...`` structural-path breadcrumb (see :func:`_yaml_breadcrumbs`) to
+    make deeply-nested blocks locatable by RAG retrieval.
 
     Raises ``RuntimeError`` if the optional ``xmltodict``/``PyYAML`` packages are
     not installed; propagates ``expat.ExpatError`` on malformed XML so callers can
@@ -1760,19 +1873,32 @@ def xml_to_yaml(raw: str) -> str:
     _BlockDumper.add_representer(str, _str_rep)
 
     parsed = xmltodict.parse(_xml_comments_to_elements(raw))
-    return yaml.dump(
+    # width=inf disables PyYAML's default 80-column line wrapping. Long *plain*
+    # scalars (e.g. space-separated IP/CIDR lists in config XML) would otherwise
+    # wrap into multi-line plain scalars — valid YAML 1.2, but strict/lightweight
+    # parsers (notably NotebookLM's RAG ingester) choke on the continuation lines
+    # and silently truncate the rest of the document. Keeping every scalar on one
+    # line avoids that failure mode at the cost of some long lines.
+    dumped = yaml.dump(
         parsed, Dumper=_BlockDumper, default_flow_style=False, sort_keys=False,
-        allow_unicode=True,
+        allow_unicode=True, width=float("inf"),
     )
+    # --yaml-index: prepend each nested block with a structural-path breadcrumb so
+    # RAG retrieval can locate it. Comments don't affect parsing, so output is the
+    # plain YAML plus comment lines (clean diff against a non-indexed run).
+    return _yaml_breadcrumbs(dumped) if index else dumped
 
 
-def convert_xml(src: Path, dest: Path, mode: str = "auto") -> Tuple[str, str, Path]:
+def convert_xml(
+    src: Path, dest: Path, mode: str = "auto", yaml_index: bool = False
+) -> Tuple[str, str, Path]:
     """Convert XML to Markdown or YAML. ``mode`` is auto | verbatim | transform | yaml.
 
     Returns ``(content, mode_used, dest_written)``. Verbatim is lossless and the
     safe default for unknown/config XML; transform is for documentation-style XML;
     yaml emits structure-preserving YAML to a sibling ``.yaml`` file (the output
     path differs from the ``.md`` ``dest`` passed in, hence the returned path).
+    ``yaml_index`` adds structural-path breadcrumbs to the YAML for RAG retrieval.
 
     A ``yaml`` request on malformed XML falls back to lossless ``verbatim``
     Markdown; a missing optional dependency is a hard error.
@@ -1783,7 +1909,7 @@ def convert_xml(src: Path, dest: Path, mode: str = "auto") -> Tuple[str, str, Pa
     chosen = xml_choose_mode(src, raw) if mode == "auto" else mode
     if chosen == "yaml":
         try:
-            content = xml_to_yaml(raw)
+            content = xml_to_yaml(raw, index=yaml_index)
         except xml.parsers.expat.ExpatError:
             chosen = "verbatim"  # malformed XML -> lossless Markdown fallback
         else:
@@ -2732,6 +2858,7 @@ def process_file(
     preview_pages: Optional[int] = None,
     visual_cfg: Optional[VisualConfig] = None,
     xml_mode: str = "auto",
+    yaml_index: bool = False,
     ocr_mode: str = "auto",
     large_doc_pages: int = DEFAULT_LARGE_DOC_PAGES,
     clean: bool = True,
@@ -2814,7 +2941,9 @@ def process_file(
             record.cleaning = wc.cleaning
             _report_cleaning(record)
         elif fmt == "xml":
-            markdown, mode_used, dest = convert_xml(src, dest, mode=xml_mode)
+            markdown, mode_used, dest = convert_xml(
+                src, dest, mode=xml_mode, yaml_index=yaml_index
+            )
             record.converter = "xml-%s" % mode_used
             if xml_mode == "auto":
                 _note_auto_decision(record, {
@@ -3027,6 +3156,7 @@ def run_batch(
     preview_pages: Optional[int] = None,
     visual_cfg: Optional[VisualConfig] = None,
     xml_mode: str = "auto",
+    yaml_index: bool = False,
     ocr_mode: str = "auto",
     large_doc_pages: int = DEFAULT_LARGE_DOC_PAGES,
     clean: bool = True,
@@ -3076,6 +3206,7 @@ def run_batch(
                 preview_pages=preview_pages,
                 visual_cfg=visual_cfg,
                 xml_mode=xml_mode,
+                yaml_index=yaml_index,
                 ocr_mode=ocr_mode,
                 large_doc_pages=large_doc_pages,
                 clean=clean,
@@ -3205,6 +3336,12 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "Takes precedence over --xml-mode.",
     )
     parser.add_argument(
+        "--yaml-index", action="store_true",
+        help="Implies --yaml, and prefixes each nested block with a '# path: ...' "
+        "structural breadcrumb so RAG ingesters (e.g. NotebookLM) can locate "
+        "deeply-nested blocks. Comments don't change the parsed data.",
+    )
+    parser.add_argument(
         "--preview", action="store_true",
         help="Quick sanity check: process only the first %d pages of each PDF."
         % DEFAULT_PREVIEW_PAGES,
@@ -3270,7 +3407,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     output_dir.mkdir(parents=True, exist_ok=True)
     quiet_third_party_logs()  # before any backend imports, so env/filters take
-    xml_mode = "yaml" if args.yaml else args.xml_mode
+    xml_mode = "yaml" if (args.yaml or args.yaml_index) else args.xml_mode
     deps = check_dependencies(need_yaml=xml_mode == "yaml")
     if not any(deps.values()):
         print(
@@ -3353,6 +3490,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         preview_pages=preview_pages,
         visual_cfg=visual_cfg,
         xml_mode=xml_mode,
+        yaml_index=args.yaml_index,
         ocr_mode=args.ocr,
         large_doc_pages=args.large_doc_pages,
         clean=not args.no_clean,
