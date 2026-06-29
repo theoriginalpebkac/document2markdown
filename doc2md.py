@@ -6,10 +6,12 @@ Conversion (handler chosen by content sniffing, not extension)
     * PDF                       -> pdfmux (per-page self-healing + confidence)
     * .docx (Word, Google Docs) -> pandoc (+ --extract-media)
     * Confluence "Word" export  -> MHTML: extract HTML + base64 images -> pandoc
+    * single-file HTML          -> de-chrome + inline data: figures -> pandoc
+    *   (incl. a Jira/Confluence "Save as Word" page misnamed .doc/.htm)
     * config XML                -> verbatim (fenced, lossless, + index)
     * documentation XML         -> transform (structured Markdown)
     *   (or --yaml / --xml-mode=yaml: XML -> structure-preserving .yaml)
-    * HTML/EPUB/RTF/ODT         -> pandoc
+    * EPUB/RTF/ODT              -> pandoc
     * CSV                       -> one Markdown card per row (heading + key/value
                                    fields; comma-delimited columns auto-detected
                                    and expanded as bullet lists); supports
@@ -1164,7 +1166,7 @@ _MIME_HEADER_RE = re.compile(
 def detect_format(path: Path) -> str:
     """Classify a file by *content*, returning one of:
 
-    ``pdf``, ``docx``, ``mhtml``, ``doc-binary``, ``xml``, ``pandoc``,
+    ``pdf``, ``docx``, ``mhtml``, ``html``, ``doc-binary``, ``xml``, ``pandoc``,
     ``unsupported``. Extensions lie (Confluence "Word" is MHTML named ``.doc``),
     so we sniff magic bytes / structure first and fall back to the extension.
     """
@@ -1201,6 +1203,15 @@ def detect_format(path: Path) -> str:
         return "mhtml"
     if path.suffix.lower() in (".mht", ".mhtml"):
         return "mhtml"
+    # Bare single-file HTML, sniffed by content so the extension can't hide it:
+    # Jira/Confluence "Save as Word" frequently emit a plain HTML page named
+    # ``.doc`` (or ``.htm``). MHTML is matched first above because it, too,
+    # contains ``<html>``. Match ``<html``/``<!doctype html`` only as the opening
+    # token (after an optional XML prolog or comments) so prose that merely
+    # mentions ``<html>`` isn't misread. Routes to the de-chroming Word/HTML path.
+    probe = re.sub(r"^\s*(?:<\?xml[^>]*\?>\s*|<!--.*?-->\s*)+", "", low, flags=re.S)
+    if probe.startswith("<!doctype html") or probe.startswith("<html"):
+        return "html"
     if path.suffix.lower() in PANDOC_EXTENSIONS:
         return "pandoc"
     if path.suffix.lower() == ".docx":
@@ -1349,6 +1360,49 @@ def _rewrite_img_srcs(html: str, key_to_meta: Dict[str, Tuple[str, str]]) -> str
     return re.sub(r"<img\b[^>]*>", repl, html, flags=re.I)
 
 
+_DATA_URI_IMG_RE = re.compile(
+    r"""<img\b[^>]*?\bsrc\s*=\s*["'](data:image/[^;"']+;base64,([^"']+))["'][^>]*>""",
+    re.I,
+)
+
+
+def _extract_data_uri_images(
+    html: str, fig_dir: Path, slug: str, rel_base: str, title: str
+) -> Tuple[str, int]:
+    """Pull base64 ``data:`` ``<img>`` blobs out of single-file HTML into figure
+    files and rewrite each tag to a slim ``<img src alt>`` reference.
+
+    Single-file HTML exports (Jira/Confluence "Save as Word") embed content
+    images inline as ``data:image/...;base64`` URIs. Decoding the content-sized
+    ones to PNG/JPG files (UI icons/badges are dropped by the same
+    :func:`_image_is_content` floor used for MHTML) keeps real figures as proper
+    Markdown images instead of letting the cleaner discard them as decorative
+    ``data:`` blobs. Returns ``(html, n_extracted)``.
+    """
+    import base64
+
+    state = {"i": 0}
+
+    def repl(m: "re.Match") -> str:
+        try:
+            data = base64.b64decode(m.group(2), validate=False)
+        except Exception:
+            return m.group(0)  # malformed -> leave for the chrome cleaner
+        ifmt = _sniff_image(data)
+        if ifmt is None or ifmt in ("emf", "wmf"):
+            return m.group(0)
+        if not _image_is_content(data, ifmt):
+            return ""  # decorative icon/badge -> drop the tag
+        state["i"] += 1
+        fig_dir.mkdir(parents=True, exist_ok=True)
+        fname = "%s-figure%02d.%s" % (slug, state["i"], ifmt)
+        (fig_dir / fname).write_bytes(data)
+        alt = "%s — figure %d" % (title, state["i"])
+        return '<img src="%s/%s" alt="%s" />' % (rel_base, fname, alt.replace('"', "'"))
+
+    return _DATA_URI_IMG_RE.sub(repl, html), state["i"]
+
+
 # Site chrome that single-page-app exports (Apple/Confluence MHTML) render into
 # the DOM but that carries no document content: global nav, breadcrumbs, footer,
 # sidebars, and script/style. Pandoc drops these from the Markdown, so the
@@ -1429,9 +1483,11 @@ def convert_word(
     clean: bool = True,
     strip_patterns: Optional[List[str]] = None,
 ) -> WordConversion:
-    """Convert a Word-family document (OOXML ``.docx`` or Confluence MHTML).
+    """Convert a Word-family document: OOXML ``.docx``, Confluence MHTML, or a
+    bare single-file ``html`` page (a Jira/Confluence "Save as Word" export,
+    often misnamed ``.doc``).
 
-    When ``clean`` (default), MHTML output is de-chromed via
+    When ``clean`` (default), MHTML/HTML output is de-chromed via
     :func:`clean_html_markdown` (visible-text-lossless) and ``.docx`` output gets
     the :func:`clean_safe_subset` (whitespace + ``--strip-line``). ``--no-clean``
     yields the raw pandoc conversion.
@@ -1465,6 +1521,24 @@ def convert_word(
         html = _rewrite_img_srcs(html, key_to_meta)
         markdown = html_to_markdown(html, have_pandoc)
         cleaning: Dict[str, object] = {}
+        if clean:
+            markdown, cleaning = clean_html_markdown(markdown, strip_patterns=strip_patterns)
+        dest.write_text(markdown, encoding="utf-8")
+        return WordConversion(
+            markdown=markdown, images=n, ref_plaintext=ref_plaintext, cleaning=cleaning
+        )
+
+    if fmt == "html":
+        # Bare single-file HTML (e.g. a Jira/Confluence "Save as Word" page named
+        # ``.doc``). Same pipeline as the MHTML branch minus the MIME unwrapping:
+        # extract inline ``data:`` figures, convert via pandoc, then de-chrome.
+        html = src.read_text(encoding="utf-8", errors="replace")
+        ref_plaintext = _strip_html(_strip_noncontent_regions(html))
+        n = 0
+        if cfg.enabled and cfg.extract_images:
+            html, n = _extract_data_uri_images(html, fig_dir, slug, rel_base, src.stem)
+        markdown = html_to_markdown(html, have_pandoc)
+        cleaning = {}
         if clean:
             markdown, cleaning = clean_html_markdown(markdown, strip_patterns=strip_patterns)
         dest.write_text(markdown, encoding="utf-8")
@@ -2956,8 +3030,8 @@ def process_file(
             _report_cleaning(record)
             if deps.get("pdftotext"):
                 original_plaintext = extract_pdf_plaintext(src, last_page=preview_pages)
-        elif fmt in ("mhtml", "docx"):
-            record.converter = "mhtml" if fmt == "mhtml" else "pandoc(docx)"
+        elif fmt in ("mhtml", "html", "docx"):
+            record.converter = {"mhtml": "mhtml", "html": "html"}.get(fmt, "pandoc(docx)")
             wc = convert_word(
                 src, dest, fmt, have_pandoc=bool(deps.get("pandoc")), visual_cfg=visual_cfg,
                 clean=clean, strip_patterns=strip_patterns,
@@ -3020,10 +3094,11 @@ def process_file(
             _report_cleaning(record)
 
         record.output_path = str(dest)
-        # Web (MHTML) fidelity is noisier than PDF/DOCX; cap its bar at the web
-        # threshold even when a stricter global --threshold is set.
+        # Web (MHTML / single-file HTML) fidelity is noisier than PDF/DOCX —
+        # SPA chrome and per-token code markup tank the char-diff — so cap its bar
+        # at the web threshold even when a stricter global --threshold is set.
         eff_threshold = similarity_threshold
-        if fmt == "mhtml":
+        if fmt in ("mhtml", "html"):
             eff_threshold = min(similarity_threshold, DEFAULT_WEB_SIMILARITY_THRESHOLD)
         result = validate(
             markdown,

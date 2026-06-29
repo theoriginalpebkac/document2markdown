@@ -43,10 +43,11 @@ so they can be imported and unit-tested on their own.
 | **PDF** | [pdfmux](https://pypi.org/project/pdfmux/) + PyMuPDF figures | self-healing extraction + confidence; the image path |
 | **`.docx`** (Word, Google Docs) | [pandoc](https://pandoc.org/) (`--extract-media`) | semantic structure + embedded images |
 | **Confluence "Word" export** (MHTML, usually `.doc`) | extract HTML + base64 images (stdlib) → pandoc | images recovered & inlined; UI icons filtered |
+| **Single-file HTML** (incl. a Jira/Confluence "Save as Word" page named `.doc`/`.htm`) | de-chrome + inline `data:` figures → pandoc | sniffed by content, not extension; UI icons filtered |
 | **Config XML** (syntax-critical) | **verbatim** — fenced ```xml``` + generated index | lossless; exact tags/attributes/values preserved |
 | **Config XML → YAML** (opt-in `--yaml`) | structure-preserving YAML (`.yaml`) | lower-token grounding for LLMs; round-trip-verified against the source XML; add `--yaml-index` for RAG-locatable breadcrumbs |
 | **Documentation XML** | **transform** — structured Markdown (headings/lists) | for XML that is really a document |
-| HTML / EPUB / RTF / ODT | pandoc | |
+| EPUB / RTF / ODT | pandoc | |
 | legacy binary `.doc` (OLE) | — | not supported; re-save as `.docx` or export PDF |
 
 ### Maximum local effort by default; LLM on demand
@@ -191,7 +192,7 @@ pip install -r requirements.txt
 
 | Tool | Used for | Install |
 | --- | --- | --- |
-| **pandoc** | Word (`.docx` + Confluence MHTML), HTML / EPUB / RTF / ODT → Markdown | macOS: `brew install pandoc` · Debian: `sudo apt-get install pandoc` |
+| **pandoc** | Word (`.docx` + Confluence MHTML), single-file HTML, EPUB / RTF / ODT → Markdown | macOS: `brew install pandoc` · Debian: `sudo apt-get install pandoc` |
 | **pdftotext** (poppler-utils) | Raw text for the fidelity comparison. Without it PDFs still convert but get no similarity score. | macOS: `brew install poppler` · Debian: `sudo apt-get install poppler-utils` |
 
 `doc2md.py` checks for all of these on startup and prints install instructions
@@ -215,7 +216,7 @@ reprocess generated output.
 | Option | Default | Description |
 | --- | --- | --- |
 | `-w`, `--workers N` | `4` | Parallel worker count. |
-| `-t`, `--threshold R` | `0.90` | Minimum ordered text-similarity ratio to pass validation. Web (MHTML) exports are capped at a relaxed `0.80` bar, since SPA chrome and per-token code markup make their character-diff inherently noisier than PDF/DOCX. |
+| `-t`, `--threshold R` | `0.90` | Minimum ordered text-similarity ratio to pass validation. Web exports (MHTML and single-file HTML) are capped at a relaxed `0.80` bar, since SPA chrome and per-token code markup make their character-diff inherently noisier than PDF/DOCX. |
 | `--min-confidence R` | `0.70` | Minimum pdfmux confidence to pass. A low ordered-similarity score is reported but **not fatal** when either pdfmux confidence clears this bar *or* order-insensitive **content recall** (≥ 0.90 of the source's word tokens present) is high. The ordered char-diff tanks on faithful conversions that reflow content — tabular/multi-column PDFs (where `pdftotext` itself splits words at line-wraps) and HTML→Markdown (Confluence/Apple MHTML) — so recall lets a content-complete conversion pass while genuine loss (low recall too) still fails. |
 | `-q`, `--quality {auto,fast,standard,high}` | `auto` | Local extraction quality. `auto` uses `standard` (max local effort) but drops to `fast` for very large PDFs (see `--large-doc-pages`), where Docling's per-page table model isn't worth the time. `fast` = PyMuPDF only. |
 | `--large-doc-pages N` | `1000` | With `--quality=auto`, PDFs larger than N pages use `fast` instead of `standard`. |
@@ -224,7 +225,7 @@ reprocess generated output.
 | `--llm {gemini,claude,openai,ollama}` | off | Enable LLM fallback for hard documents. |
 | `--llm-budget USD` | — | Per-document spend cap when `--llm` is set. |
 | `--no-figures` | off | Text-only Markdown (disable all image extraction). |
-| `--no-clean` | off (cleaning **on**) | Disable the default Markdown cleanup. Cleanup is per-format and verified lossless (falls back to raw if it can't be proven): **PDF** — safe page-number/date furniture, empty duplicate tables, line-wrap token-split repair (`<a:b.ma x-c>` → `<a:b.max-c>`); **MHTML** — single-page-app chrome (`data:` icon images, empty `div`/`span` scaffolding); **docx/web (pandoc)** — whitespace normalization + `--strip-line`. Use `--no-clean` for the raw, true-to-source extraction. |
+| `--no-clean` | off (cleaning **on**) | Disable the default Markdown cleanup. Cleanup is per-format and verified lossless (falls back to raw if it can't be proven): **PDF** — safe page-number/date furniture, empty duplicate tables, line-wrap token-split repair (`<a:b.ma x-c>` → `<a:b.max-c>`); **MHTML / single-file HTML** — single-page-app chrome (`data:` icon images, empty `div`/`span` scaffolding); **docx/web (pandoc)** — whitespace normalization + `--strip-line`. Use `--no-clean` for the raw, true-to-source extraction. |
 | `--strip-line REGEX` | — | During cleanup (any format), also remove lines that *fully* match REGEX — for document/corpus-specific header/footer chrome (company names, confidentiality notices, running titles) that can't be detected automatically. Repeatable. Still verified lossless. |
 | `--vector-diagrams` | off | Best-effort vector-diagram extraction (see caveat). |
 | `--figure-dpi N` | `150` | Render DPI for extracted PNGs. |
