@@ -77,7 +77,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 try:
     import pymupdf  # PyMuPDF >= 1.24
@@ -582,6 +582,17 @@ def _derive_title(markdown: str, src: Path, fmt: str) -> str:
     return re.sub(r"[-_]+", " ", src.stem).strip()
 
 
+def _frontmatter_source_path(src: Path, input_root: Path, absolute: bool) -> str:
+    """The ``source_path`` value: relative to the input root by default (so a
+    shared corpus doesn't leak machine/folder names), absolute when requested."""
+    if absolute:
+        return str(src.resolve())
+    try:
+        return str(src.resolve().relative_to(input_root.resolve()))
+    except ValueError:  # src outside input_root (e.g. single-file run)
+        return src.name
+
+
 def build_frontmatter(
     *,
     title: str,
@@ -593,15 +604,19 @@ def build_frontmatter(
     quality: Optional[str] = None,
     page_count: Optional[int] = None,
     confidence: Optional[float] = None,
+    part: Optional[int] = None,
+    parts: Optional[int] = None,
 ) -> str:
     """Build the YAML frontmatter block (provenance + engine facts) for a ``.md``.
 
     Strings go through :func:`safe_yaml_string`; only genuine numerics
-    (``page_count``, ``confidence``) are bare. ``confidence`` is omitted when
-    ``None`` so typed downstream loaders never meet an unexpected null;
-    ``quality``/``page_count``/``confidence`` are PDF-only. ``converted`` is the
-    source file's mtime (deterministic, idempotent — not wall-clock "now") as a
-    quoted ISO date string.
+    (``page_count``, ``confidence``, ``part``/``parts``) are bare. ``confidence``
+    is omitted when ``None`` so typed downstream loaders never meet an unexpected
+    null; ``quality``/``page_count``/``confidence`` are PDF-only. ``part``/
+    ``parts`` carry split-output provenance (e.g. a large CSV split into
+    ``<stem>-partNNN.md``) so every atomic file knows which slice it is.
+    ``converted`` is the source file's mtime (deterministic, idempotent — not
+    wall-clock "now") as a quoted ISO date string.
     """
     converted = datetime.date.fromtimestamp(mtime).isoformat()
     lines = ["---"]
@@ -615,6 +630,10 @@ def build_frontmatter(
         lines.append("quality: " + safe_yaml_string(quality))
     if page_count is not None:
         lines.append("page_count: %d" % page_count)
+    if part is not None:
+        lines.append("part: %d" % part)
+    if parts is not None:
+        lines.append("parts: %d" % parts)
     if confidence is not None:
         lines.append("confidence: %s" % round(confidence, 4))
     lines.append("converted: " + safe_yaml_string(converted))
@@ -2497,6 +2516,7 @@ def convert_csv(
     skip_columns: Optional[List[str]] = None,
     title_column: Optional[str] = None,
     split_bytes: Optional[int] = None,
+    frontmatter: Optional[Callable[[Optional[int], Optional[int]], str]] = None,
 ) -> CsvConversion:
     """Convert a CSV to Markdown cards (one card per row) and write to ``dest``.
 
@@ -2510,6 +2530,12 @@ def convert_csv(
     ``<stem>-part002.md``, … at card boundaries so no file exceeds the threshold.
     Cards are never split mid-card. The ``--clean`` pass is intentionally
     skipped for CSV — the output is generated clean by construction.
+
+    ``frontmatter`` is an optional ``(part, parts) -> yaml_block`` callable. It is
+    prepended to **every** output file so each atomic split part retains its
+    provenance (called with ``(None, None)`` for unsplit output, and ``(i, M)``
+    per part otherwise). The block counts toward the per-part byte budget so the
+    split guarantee still holds.
     """
     import csv as _csv
 
@@ -2544,33 +2570,45 @@ def convert_csv(
             )
         cards.append(_render_csv_card(row, title_col, id_col, list_cols, skip_set))
 
-    def _write_part(buf: List[str], path: Path) -> None:
-        path.write_text("\n\n---\n\n".join(buf) + "\n", encoding="utf-8")
+    def _write_part(buf: List[str], path: Path, fm: str = "") -> None:
+        body = "\n\n---\n\n".join(buf) + "\n"
+        path.write_text((fm + "\n\n" + body) if fm else body, encoding="utf-8")
 
     if split_bytes is None:
-        _write_part(cards, dest)
+        _write_part(cards, dest, frontmatter(None, None) if frontmatter else "")
         return CsvConversion(cards=len(cards), rows=len(rows), output_paths=[dest], warnings=warnings)
 
-    # Split at card boundaries so no file exceeds split_bytes.
-    output_paths: List[Path] = []
-    part, buf, buf_size = 1, [], 0
+    # Partition cards into byte-bounded groups (never splitting a card), then
+    # write each — frontmatter is prepended to every part with the now-known
+    # total. Cards are already all in memory, so grouping first costs nothing
+    # extra and lets each part stamp "part i of M".
     sep_size = len("\n\n---\n\n".encode())
+    # Reserve the frontmatter's worst-case size from the budget so a part with
+    # its YAML block still respects split_bytes (digits of part/parts vary by a
+    # few bytes — overestimate with a high sample).
+    fm_overhead = (
+        len((frontmatter(999, 999) + "\n\n").encode()) if frontmatter else 0
+    )
+    budget = max(1, split_bytes - fm_overhead)
 
+    groups: List[List[str]] = []
+    buf, buf_size = [], 0
     for card in cards:
         card_bytes = len(card.encode())
         overhead = sep_size if buf else 0
-        if buf and buf_size + overhead + card_bytes > split_bytes:
-            pth = dest.parent / ("%s-part%03d%s" % (dest.stem, part, dest.suffix))
-            _write_part(buf, pth)
-            output_paths.append(pth)
-            part += 1
+        if buf and buf_size + overhead + card_bytes > budget:
+            groups.append(buf)
             buf, buf_size = [], 0
         buf.append(card)
         buf_size += (sep_size if len(buf) > 1 else 0) + card_bytes
-
     if buf:
-        pth = dest.parent / ("%s-part%03d%s" % (dest.stem, part, dest.suffix))
-        _write_part(buf, pth)
+        groups.append(buf)
+
+    output_paths: List[Path] = []
+    total = len(groups)
+    for i, group in enumerate(groups, 1):
+        pth = dest.parent / ("%s-part%03d%s" % (dest.stem, i, dest.suffix))
+        _write_part(group, pth, frontmatter(i, total) if frontmatter else "")
         output_paths.append(pth)
 
     return CsvConversion(
@@ -3389,6 +3427,26 @@ def process_file(
                 source_xml = src.read_text(encoding="utf-8", errors="replace")
         elif fmt == "csv":
             record.converter = "csv"
+            # Frontmatter is injected per output file (so every split part keeps
+            # its provenance), not via the central prepend below — CSV returns
+            # early. The closure stamps part/parts once convert_csv knows them.
+            csv_fm: Optional[Callable[[Optional[int], Optional[int]], str]] = None
+            if rag_metadata:
+                csv_src_path = _frontmatter_source_path(src, input_root, source_abspath)
+                csv_mtime = src.stat().st_mtime
+
+                def csv_fm(part, parts, _path=csv_src_path, _mtime=csv_mtime):
+                    return build_frontmatter(
+                        title=_derive_title("", src, "csv"),
+                        source_file=src.name,
+                        source_path=_path,
+                        fmt="csv",
+                        engine="csv",
+                        mtime=_mtime,
+                        part=part,
+                        parts=parts,
+                    )
+
             cc = convert_csv(
                 src, dest,
                 list_min_segments=csv_list_min_segments,
@@ -3397,6 +3455,7 @@ def process_file(
                 skip_columns=csv_skip_columns,
                 title_column=csv_title_column,
                 split_bytes=split_bytes,
+                frontmatter=csv_fm,
             )
             for w in cc.warnings:
                 print("[csv] %s: warning — %s" % (src.name, w), file=sys.stderr)
@@ -3428,19 +3487,14 @@ def process_file(
         # whose top-level "---" would start a second YAML document). Done here,
         # centrally, so every Markdown-producing format gets it identically; the
         # block is part of the validated string (== on disk) and is stripped
-        # before the fidelity comparison. CSV returns earlier and is unaffected.
+        # before the fidelity comparison. CSV returns earlier and injects its own
+        # frontmatter per split part (see the csv branch above).
         if rag_metadata and output_format == "markdown":
             try:
-                rel = str(src.resolve())
-                if not source_abspath:
-                    try:
-                        rel = str(src.resolve().relative_to(input_root.resolve()))
-                    except ValueError:
-                        rel = src.name  # src outside input_root (single-file run)
                 frontmatter = build_frontmatter(
                     title=_derive_title(markdown, src, fmt),
                     source_file=src.name,
-                    source_path=rel,
+                    source_path=_frontmatter_source_path(src, input_root, source_abspath),
                     fmt=fmt,
                     engine=record.converter,
                     mtime=src.stat().st_mtime,

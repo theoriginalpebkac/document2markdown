@@ -265,3 +265,73 @@ def test_derive_title_prefers_first_h1():
 def test_derive_title_falls_back_to_deslugified_filename():
     title = doc2md._derive_title("no heading here", pathlib.Path("network_design-spec.docx"), "docx")
     assert title == "network design spec"
+
+
+# --------------------------------------------------------------------------- #
+# CSV per-part frontmatter
+# --------------------------------------------------------------------------- #
+
+def _csv_frontmatter(src):
+    """The same closure process_file builds for the CSV path."""
+    def fm(part, parts):
+        return doc2md.build_frontmatter(
+            title=doc2md._derive_title("", src, "csv"),
+            source_file=src.name, source_path=src.name, fmt="csv", engine="csv",
+            mtime=0.0, part=part, parts=parts,
+        )
+    return fm
+
+
+def _write_csv(path, n_rows):
+    rows = "\n".join("Item %d,Description for item %d" % (i, i) for i in range(n_rows))
+    path.write_text("name,description\n" + rows + "\n", encoding="utf-8")
+
+
+def test_csv_single_file_gets_frontmatter_without_part_fields(tmp_path):
+    src = tmp_path / "catalog.csv"
+    _write_csv(src, 3)
+    cc = doc2md.convert_csv(src, tmp_path / "catalog.md", frontmatter=_csv_frontmatter(src))
+    body = cc.output_paths[0].read_text()
+    data = _parse_frontmatter(body[: body.index("\n---", 4) + 4])
+    assert data["format"] == "csv" and data["source_file"] == "catalog.csv"
+    assert data["title"] == "catalog"
+    assert "part" not in data and "parts" not in data  # unsplit -> no part numbering
+
+
+def test_csv_every_split_part_carries_provenance(tmp_path):
+    src = tmp_path / "big.csv"
+    _write_csv(src, 60)
+    # Tiny split size forces several parts.
+    cc = doc2md.convert_csv(
+        src, tmp_path / "big.md", split_bytes=400, frontmatter=_csv_frontmatter(src)
+    )
+    assert len(cc.output_paths) > 1
+    total = len(cc.output_paths)
+    for i, pth in enumerate(cc.output_paths, 1):
+        text = pth.read_text()
+        assert text.startswith("---\n")  # every atomic part has frontmatter
+        data = _parse_frontmatter(text[: text.index("\n---", 4) + 4])
+        assert data["source_file"] == "big.csv"
+        assert data["part"] == i and data["parts"] == total
+        assert "## Item" in text  # cards still present below the block
+
+
+def test_csv_split_respects_byte_budget_including_frontmatter(tmp_path):
+    src = tmp_path / "budget.csv"
+    _write_csv(src, 80)
+    cc = doc2md.convert_csv(
+        src, tmp_path / "budget.md", split_bytes=600, frontmatter=_csv_frontmatter(src)
+    )
+    # No part (frontmatter + cards) exceeds the budget, except a lone oversized
+    # card which is allowed its own part (matches pre-existing behavior).
+    for pth in cc.output_paths:
+        size = len(pth.read_text().encode())
+        n_cards = pth.read_text().count("## Item")
+        assert size <= 600 or n_cards == 1
+
+
+def test_csv_no_frontmatter_when_callable_absent(tmp_path):
+    src = tmp_path / "plain.csv"
+    _write_csv(src, 2)
+    cc = doc2md.convert_csv(src, tmp_path / "plain.md")  # no frontmatter callable
+    assert not cc.output_paths[0].read_text().startswith("---")
