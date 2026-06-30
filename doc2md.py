@@ -63,6 +63,7 @@ pipeline on that slice. Visuals are extracted from the same slice.
 from __future__ import annotations
 
 import argparse
+import datetime
 import difflib
 import json
 import logging
@@ -76,7 +77,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 try:
     import pymupdf  # PyMuPDF >= 1.24
@@ -89,6 +90,8 @@ except ImportError:  # pragma: no cover - exercised only where PyMuPDF is absent
 # --------------------------------------------------------------------------- #
 # Configuration / defaults
 # --------------------------------------------------------------------------- #
+
+__version__ = "0.2.0"
 
 DEFAULT_WORKERS = 4
 DEFAULT_SIMILARITY_THRESHOLD = 0.90
@@ -328,6 +331,315 @@ def check_dependencies(*, need_yaml: bool = False) -> Dict[str, bool]:
             seen.add(msg)
 
     return available
+
+
+# --------------------------------------------------------------------------- #
+# RAG provenance metadata: YAML frontmatter + page-boundary markers
+# --------------------------------------------------------------------------- #
+#
+# Two layers of "invisible" provenance for RAG pipelines, both governed by one
+# switch (``--no-rag-metadata`` to disable; on by default):
+#
+#  * **Frontmatter** — a YAML block at the top of every ``.md`` output carrying
+#    routing/filtering facts (source file, engine, confidence, …). It is the
+#    citation anchor for retrieved chunks. String values are emitted via
+#    :func:`safe_yaml_string` (``json.dumps`` — JSON being a subset of YAML)
+#    so colons/quotes/Unicode can't break the block and YAML 1.1's type coercion
+#    (the "Norway problem": ``NO`` -> ``False``; ``1.10`` -> ``1.1``) can't
+#    silently corrupt a string field.
+#  * **Page markers** — ``<!-- doc2md:page=N -->`` HTML comments at every PDF
+#    page boundary, so a chunk's source page survives even after page numbers are
+#    stripped from the prose. Namespaced so the fidelity check (and downstream
+#    parsers) can target *our* markers without touching genuine source comments.
+#
+# Both are stripped before the fidelity comparison (see :func:`strip_markdown`),
+# so they never depress the pdftotext-similarity score.
+
+# Marker emitted at every PDF page boundary. The ``=`` is load-bearing twice
+# over: it makes the pattern trivially greppable downstream, and it makes
+# clean_markdown's tag-split repair skip the marker (it bails on any ``<...>``
+# containing ``=``), so the marker survives cleaning untouched.
+PAGE_MARKER_TEMPLATE = "<!-- doc2md:page=%d -->"
+# Bare marker only (no surrounding whitespace) so stripping an *inline* marker
+# leaves a separator behind — "long <!-- ... --> sentence" must not collapse to
+# "longsentence". The fidelity comparison normalizes whitespace afterwards.
+_PAGE_MARKER_RE = re.compile(r"<!--\s*doc2md:page=\d+\s*-->")
+# A leading YAML frontmatter block (only ever at the very top of a file).
+_FRONTMATTER_RE = re.compile(r"\A﻿?---\n.*?\n---\n", re.S)
+
+# Sentence-final punctuation, optionally trailed by closing quotes/brackets, at
+# end of a line (":" included — it terminates a clause before a list/figure).
+_SENTENCE_END_RE = re.compile(r"[.!?:][\"')\]»”]*\s*$")
+# Same, mid-text, used to find the first sentence boundary to snap a marker to.
+# Excludes ":" so "Note: ..." doesn't snap early; the boundary is *after* the
+# punctuation and any closing quotes, before whitespace.
+_SENTENCE_SPLIT_RE = re.compile(r"[.!?][\"')\]»”]*(?=\s)")
+
+
+def safe_yaml_string(val: object) -> str:
+    """Quote a value as a YAML string that survives both YAML 1.1 and 1.2.
+
+    JSON is a subset of YAML 1.2, and ``json.dumps`` always double-quotes a
+    string with standard escapes that YAML 1.1 also accepts — so this both
+    escapes colons/quotes/control chars *and* freezes the type as a string,
+    neutralizing YAML 1.1's coercion of bare scalars (``NO`` -> bool,
+    ``1.10`` -> float). ``ensure_ascii=False`` keeps Unicode readable.
+    """
+    return json.dumps(str(val), ensure_ascii=False)
+
+
+def _is_structural_line(stripped: str) -> bool:
+    """True if a (already-stripped) line is a Markdown block element, not prose.
+
+    Used to keep sentence-snap from placing a page marker inside a table, code
+    fence, list item, heading, blockquote, image, or existing comment.
+    """
+    if not stripped:
+        return True
+    if stripped.startswith(("#", ">", "|", "```", "~~~", "<!--", "![")):
+        return True
+    if re.match(r"[-*+]\s", stripped):
+        return True
+    if re.match(r"\d+[.)]\s", stripped):
+        return True
+    if _TABLE_DELIM_RE.match(stripped):
+        return True
+    return False
+
+
+def _last_nonempty_line(text: str) -> str:
+    for ln in reversed(text.splitlines()):
+        if ln.strip():
+            return ln.strip()
+    return ""
+
+
+def _first_nonempty_line(text: str) -> str:
+    for ln in text.splitlines():
+        if ln.strip():
+            return ln.strip()
+    return ""
+
+
+def _ends_midsentence(text: str) -> bool:
+    """True if ``text``'s last prose line looks like a sentence cut by a page break.
+
+    A structural last line (table row, heading, list item, …) is never a
+    mid-sentence break. A line ending in sentence-final punctuation is complete;
+    a line ending in a hyphen, or in anything else, is treated as continuing.
+    """
+    line = _last_nonempty_line(text)
+    if not line or _is_structural_line(line):
+        return False
+    if _SENTENCE_END_RE.search(line):
+        return False
+    return True
+
+
+def _starts_continuation(text: str) -> bool:
+    """True if ``text``'s first line reads as prose continuing a prior sentence."""
+    line = _first_nonempty_line(text)
+    if not line or _is_structural_line(line):
+        return False
+    return line[0].isalnum() or line[0] in "(\"'«“"
+
+
+def _split_first_sentence(text: str) -> Tuple[Optional[str], str]:
+    """Split ``text`` after the first sentence boundary in its leading prose.
+
+    Returns ``(head, rest)`` where ``head`` ends the bridging sentence. The
+    search is confined to the leading prose paragraph (it stops at the first
+    blank or structural line), so a marker can never be snapped into a table or
+    code block. A paragraph break counts as a boundary even without terminal
+    punctuation. Returns ``(None, text)`` only when the whole page is one
+    unbroken prose paragraph with no sentence end — the drift-cap case.
+    """
+    lines = text.splitlines(keepends=True)
+    region_len = 0
+    for ln in lines:
+        if _is_structural_line(ln.strip()):  # also true for blank lines
+            break
+        region_len += len(ln)
+    if region_len == 0:
+        return None, text
+    region = text[:region_len]
+    m = _SENTENCE_SPLIT_RE.search(region)
+    if m:
+        cut = m.end()
+        return text[:cut].rstrip(), text[cut:].lstrip()
+    if region_len < len(text):  # paragraph ends at a blank/structural boundary
+        return region.rstrip(), text[region_len:].lstrip()
+    return None, text
+
+
+def _join_bridge(prev_tail: str, head: str) -> str:
+    """Join a sentence fragment split across a page break into contiguous prose.
+
+    Dehyphenates a word broken by the page break (``config-`` + ``uration`` ->
+    ``configuration``); otherwise joins with a single space so the sentence
+    reflows naturally instead of being torn into two paragraphs by a hard break.
+    """
+    p = prev_tail.rstrip()
+    h = head.lstrip()
+    if not h:
+        return p
+    if p.endswith("-") and len(p) >= 2 and p[-2].isalpha() and h[0].isalpha():
+        return p[:-1] + h
+    return p + " " + h
+
+
+def _assemble_with_page_markers(
+    units: List[Tuple[int, str, str]], mark_pages: bool
+) -> str:
+    """Assemble per-page (index, text, visual_md) units into the document body.
+
+    With ``mark_pages`` off this reproduces the legacy join exactly (page text
+    and visual blocks separated by blank lines). With it on, a
+    ``<!-- doc2md:page=N -->`` marker is emitted at every page boundary
+    (including blank pages, for continuity), a sentence bridging two pages is
+    rejoined into contiguous prose, and the marker is snapped forward to just
+    after that sentence completes — so the marker never falls mid-sentence and
+    the bridged sentence is never split across chunks. When a page is one
+    unbroken paragraph with no sentence end (drift cap), the marker is placed
+    inline at the exact boundary rather than drifting past the next page.
+    """
+    if not mark_pages:
+        parts: List[str] = []
+        for _, text, visual_md in units:
+            if text.strip():
+                parts.append(text)
+            if visual_md:
+                parts.append(visual_md)
+        return "\n\n".join(p for p in parts if p)
+
+    segs: List[List[str]] = []  # [text, separator_before]
+
+    def emit(text: str, sep: str) -> None:
+        segs.append([text, sep])
+
+    prose_idx: Optional[int] = None  # seg index of the last bridge-eligible prose
+    prose_text = ""
+    for page_index, text, visual_md in units:
+        marker = PAGE_MARKER_TEMPLATE % (page_index + 1)
+        if text.strip():
+            bridging = (
+                prose_idx is not None
+                and _ends_midsentence(prose_text)
+                and _starts_continuation(text)
+            )
+            if bridging:
+                head, rest = _split_first_sentence(text)
+                if head is not None:
+                    segs[prose_idx][0] = _join_bridge(segs[prose_idx][0], head)
+                    emit(marker, "\n\n")  # snap: marker after the completed sentence
+                    if rest.strip():
+                        emit(rest, "\n\n")
+                        prose_idx = len(segs) - 1
+                        prose_text = rest
+                    else:  # whole page was just the bridging tail
+                        prose_text = segs[prose_idx][0]
+                else:  # drift cap: inline marker, keep prose contiguous
+                    emit(marker, " ")
+                    emit(text, " ")
+                    prose_idx = len(segs) - 1
+                    prose_text = text
+            else:
+                emit(marker, "\n\n")
+                emit(text, "\n\n")
+                prose_idx = len(segs) - 1
+                prose_text = text
+        else:  # blank page: still mark it, but it breaks prose adjacency
+            emit(marker, "\n\n")
+            prose_idx, prose_text = None, ""
+        if visual_md:  # a figure block separates this page's prose from the next
+            emit(visual_md, "\n\n")
+            prose_idx, prose_text = None, ""
+
+    out = ""
+    for text, sep in segs:
+        if not text:
+            continue
+        out = text if out == "" else out + sep + text
+    return out
+
+
+def _derive_title(markdown: str, src: Path, fmt: str) -> str:
+    """Best-effort document title: PDF metadata -> first H1 -> de-slugified name."""
+    if fmt == "pdf" and pymupdf is not None:
+        try:
+            doc = pymupdf.open(str(src))
+            try:
+                meta_title = (doc.metadata or {}).get("title") or ""
+            finally:
+                doc.close()
+            if meta_title.strip():
+                return meta_title.strip()
+        except Exception:  # pragma: no cover - metadata read is best-effort
+            pass
+    m = re.search(r"^\s{0,3}#\s+(.+?)\s*$", markdown, flags=re.MULTILINE)
+    if m:
+        return m.group(1).strip()
+    return re.sub(r"[-_]+", " ", src.stem).strip()
+
+
+def _frontmatter_source_path(src: Path, input_root: Path, absolute: bool) -> str:
+    """The ``source_path`` value: relative to the input root by default (so a
+    shared corpus doesn't leak machine/folder names), absolute when requested."""
+    if absolute:
+        return str(src.resolve())
+    try:
+        return str(src.resolve().relative_to(input_root.resolve()))
+    except ValueError:  # src outside input_root (e.g. single-file run)
+        return src.name
+
+
+def build_frontmatter(
+    *,
+    title: str,
+    source_file: str,
+    source_path: str,
+    fmt: str,
+    engine: Optional[str],
+    mtime: float,
+    quality: Optional[str] = None,
+    page_count: Optional[int] = None,
+    confidence: Optional[float] = None,
+    part: Optional[int] = None,
+    parts: Optional[int] = None,
+) -> str:
+    """Build the YAML frontmatter block (provenance + engine facts) for a ``.md``.
+
+    Strings go through :func:`safe_yaml_string`; only genuine numerics
+    (``page_count``, ``confidence``, ``part``/``parts``) are bare. ``confidence``
+    is omitted when ``None`` so typed downstream loaders never meet an unexpected
+    null; ``quality``/``page_count``/``confidence`` are PDF-only. ``part``/
+    ``parts`` carry split-output provenance (e.g. a large CSV split into
+    ``<stem>-partNNN.md``) so every atomic file knows which slice it is.
+    ``converted`` is the source file's mtime (deterministic, idempotent — not
+    wall-clock "now") as a quoted ISO date string.
+    """
+    converted = datetime.date.fromtimestamp(mtime).isoformat()
+    lines = ["---"]
+    lines.append("title: " + safe_yaml_string(title))
+    lines.append("source_file: " + safe_yaml_string(source_file))
+    lines.append("source_path: " + safe_yaml_string(source_path))
+    lines.append("format: " + safe_yaml_string(fmt))
+    if engine:
+        lines.append("engine: " + safe_yaml_string(engine))
+    if quality:
+        lines.append("quality: " + safe_yaml_string(quality))
+    if page_count is not None:
+        lines.append("page_count: %d" % page_count)
+    if part is not None:
+        lines.append("part: %d" % part)
+    if parts is not None:
+        lines.append("parts: %d" % parts)
+    if confidence is not None:
+        lines.append("confidence: %s" % round(confidence, 4))
+    lines.append("converted: " + safe_yaml_string(converted))
+    lines.append("doc2md_version: " + safe_yaml_string(__version__))
+    lines.append("---")
+    return "\n".join(lines)
 
 
 # --------------------------------------------------------------------------- #
@@ -665,40 +977,66 @@ def build_markdown_with_visuals(
     dest: Path,
     cfg: VisualConfig,
     doc_title: str,
+    mark_pages: bool = False,
 ) -> Tuple[str, List[Visual]]:
-    """Interleave pdfmux per-page text with inline visual blocks for that page.
+    """Combine pdfmux text with extracted visual blocks, keeping figures near
+    their page's context.
 
-    ``pages_text`` is ``[(page_index, markdown_text), ...]`` from pdfmux. Figures
-    land directly after the text of the page they came from, keeping them near
-    their context for RAG. PNGs go in ``<slug>/figures/`` next to the .md, named
-    ``<slug>-pNNN-<kind>NN.png`` (slug = the .md stem). ``doc_title`` is the
-    original document name, used in figure alt text.
+    Visual extraction runs over the PDF's **real page range** (PyMuPDF owns page
+    geometry), *independent* of how pdfmux segmented the text — so figures on
+    every page are captured, not just those on the one page that happens to align
+    with a text unit. PNGs go in ``<slug>/figures/`` next to the .md, named
+    ``<slug>-pNNN-<kind>NN.png``. ``doc_title`` is used in figure alt text.
+
+    Placement depends on whether pdfmux gave us **per-page text**:
+
+    * Per-page (``len(pages_text) > 1``): each page's visuals are interleaved
+      right after that page's text, and — with ``mark_pages`` — a
+      ``<!-- doc2md:page=N -->`` marker is woven in at every page boundary.
+    * Single combined blob: there is no per-page anchor to interleave into, so
+      visuals are appended **grouped by page** under a heading at the end of the
+      document. Provenance survives via each block's ``[Figure — p.N]`` label and
+      page-stamped alt text; only inline placement is degraded, and that
+      self-heals once pdfmux exposes per-page text again. Page markers are
+      suppressed here for the same reason (a lone ``page=1`` would mislead).
     """
-    if not cfg.enabled or pymupdf is None:
-        return "\n\n".join(t for _, t in pages_text), []
+    visuals_enabled = cfg.enabled and pymupdf is not None
+    have_per_page_text = len(pages_text) > 1
+    mark_pages = mark_pages and have_per_page_text
 
     slug = dest.stem  # already slugified by _output_path_for
     fig_dir = dest.parent / slug / "figures"
     rel_base = "%s/figures" % slug
 
     visuals_all: List[Visual] = []
-    parts: List[str] = []
-    doc = pymupdf.open(str(pdf_path))
+    visual_md_by_page: Dict[int, str] = {}
+    doc = pymupdf.open(str(pdf_path)) if visuals_enabled else None
     try:
-        for page_index, text in pages_text:
-            if text and text.strip():
-                parts.append(text)
-            if 0 <= page_index < doc.page_count:
+        if doc is not None:
+            for page_index in range(doc.page_count):
                 vis = extract_page_visuals(
                     doc[page_index], page_index, fig_dir, rel_base, slug, doc_title, cfg
                 )
                 if vis:
-                    parts.append(render_visual_markdown(vis))
+                    visual_md_by_page[page_index] = render_visual_markdown(vis)
                     visuals_all.extend(vis)
     finally:
-        doc.close()
+        if doc is not None:
+            doc.close()
 
-    return "\n\n".join(p for p in parts if p), visuals_all
+    if have_per_page_text:
+        units = [
+            (idx, text or "", visual_md_by_page.get(idx, "")) for idx, text in pages_text
+        ]
+        return _assemble_with_page_markers(units, mark_pages), visuals_all
+
+    # Single combined blob: emit the text, then append page-ordered visual blocks.
+    blob = "\n\n".join(t for _, t in pages_text if t and t.strip())
+    grouped = [visual_md_by_page[i] for i in sorted(visual_md_by_page)]
+    if not grouped:
+        return blob, visuals_all
+    parts = ([blob] if blob else []) + ["## Figures & tables (by page)"] + grouped
+    return "\n\n".join(parts), visuals_all
 
 
 # --------------------------------------------------------------------------- #
@@ -1086,6 +1424,7 @@ def convert_pdf(
     visual_cfg: Optional[VisualConfig] = None,
     clean: bool = True,
     strip_patterns: Optional[List[str]] = None,
+    page_markers: bool = False,
 ) -> PdfConversion:
     """Convert a PDF to Markdown (pdfmux) + extract visuals (PyMuPDF), write ``dest``.
 
@@ -1107,7 +1446,7 @@ def convert_pdf(
 
         pages_text, confidence, min_conf = _extract_pdf_pages(work_src, quality)
         markdown, visuals = build_markdown_with_visuals(
-            pages_text, work_src, dest, cfg, doc_title=src.stem
+            pages_text, work_src, dest, cfg, doc_title=src.stem, mark_pages=page_markers
         )
     finally:
         if tmpdir is not None:
@@ -2177,6 +2516,7 @@ def convert_csv(
     skip_columns: Optional[List[str]] = None,
     title_column: Optional[str] = None,
     split_bytes: Optional[int] = None,
+    frontmatter: Optional[Callable[[Optional[int], Optional[int]], str]] = None,
 ) -> CsvConversion:
     """Convert a CSV to Markdown cards (one card per row) and write to ``dest``.
 
@@ -2190,6 +2530,12 @@ def convert_csv(
     ``<stem>-part002.md``, … at card boundaries so no file exceeds the threshold.
     Cards are never split mid-card. The ``--clean`` pass is intentionally
     skipped for CSV — the output is generated clean by construction.
+
+    ``frontmatter`` is an optional ``(part, parts) -> yaml_block`` callable. It is
+    prepended to **every** output file so each atomic split part retains its
+    provenance (called with ``(None, None)`` for unsplit output, and ``(i, M)``
+    per part otherwise). The block counts toward the per-part byte budget so the
+    split guarantee still holds.
     """
     import csv as _csv
 
@@ -2224,33 +2570,45 @@ def convert_csv(
             )
         cards.append(_render_csv_card(row, title_col, id_col, list_cols, skip_set))
 
-    def _write_part(buf: List[str], path: Path) -> None:
-        path.write_text("\n\n---\n\n".join(buf) + "\n", encoding="utf-8")
+    def _write_part(buf: List[str], path: Path, fm: str = "") -> None:
+        body = "\n\n---\n\n".join(buf) + "\n"
+        path.write_text((fm + "\n\n" + body) if fm else body, encoding="utf-8")
 
     if split_bytes is None:
-        _write_part(cards, dest)
+        _write_part(cards, dest, frontmatter(None, None) if frontmatter else "")
         return CsvConversion(cards=len(cards), rows=len(rows), output_paths=[dest], warnings=warnings)
 
-    # Split at card boundaries so no file exceeds split_bytes.
-    output_paths: List[Path] = []
-    part, buf, buf_size = 1, [], 0
+    # Partition cards into byte-bounded groups (never splitting a card), then
+    # write each — frontmatter is prepended to every part with the now-known
+    # total. Cards are already all in memory, so grouping first costs nothing
+    # extra and lets each part stamp "part i of M".
     sep_size = len("\n\n---\n\n".encode())
+    # Reserve the frontmatter's worst-case size from the budget so a part with
+    # its YAML block still respects split_bytes (digits of part/parts vary by a
+    # few bytes — overestimate with a high sample).
+    fm_overhead = (
+        len((frontmatter(999, 999) + "\n\n").encode()) if frontmatter else 0
+    )
+    budget = max(1, split_bytes - fm_overhead)
 
+    groups: List[List[str]] = []
+    buf, buf_size = [], 0
     for card in cards:
         card_bytes = len(card.encode())
         overhead = sep_size if buf else 0
-        if buf and buf_size + overhead + card_bytes > split_bytes:
-            pth = dest.parent / ("%s-part%03d%s" % (dest.stem, part, dest.suffix))
-            _write_part(buf, pth)
-            output_paths.append(pth)
-            part += 1
+        if buf and buf_size + overhead + card_bytes > budget:
+            groups.append(buf)
             buf, buf_size = [], 0
         buf.append(card)
         buf_size += (sep_size if len(buf) > 1 else 0) + card_bytes
-
     if buf:
-        pth = dest.parent / ("%s-part%03d%s" % (dest.stem, part, dest.suffix))
-        _write_part(buf, pth)
+        groups.append(buf)
+
+    output_paths: List[Path] = []
+    total = len(groups)
+    for i, group in enumerate(groups, 1):
+        pth = dest.parent / ("%s-part%03d%s" % (dest.stem, i, dest.suffix))
+        _write_part(group, pth, frontmatter(i, total) if frontmatter else "")
         output_paths.append(pth)
 
     return CsvConversion(
@@ -2288,6 +2646,10 @@ _IMAGE_RE = re.compile(r"!\[[^\]]*\]\([^)]*\)")
 def strip_markdown(md: str) -> str:
     """Reduce Markdown to plain-text content for fidelity comparison."""
     text = md
+    # Drop our RAG provenance layers first so injected metadata never registers
+    # as "added" text against the pdftotext baseline and depresses similarity.
+    text = _FRONTMATTER_RE.sub("", text)  # leading YAML frontmatter block
+    text = _PAGE_MARKER_RE.sub("", text)  # doc2md:page=N boundary markers
     text = re.sub(r"^\s*(```|~~~).*$", "", text, flags=re.MULTILINE)  # fence lines
     text = re.sub(r"`([^`]*)`", r"\1", text)  # inline code
     text = _IMAGE_RE.sub("", text)  # images (refs carry no source text)
@@ -2965,6 +3327,8 @@ def process_file(
     clean: bool = True,
     strip_patterns: Optional[List[str]] = None,
     used_llm: bool = False,
+    rag_metadata: bool = True,
+    source_abspath: bool = False,
     csv_list_min_segments: int = DEFAULT_CSV_LIST_MIN_SEGMENTS,
     csv_list_max_segment_len: int = DEFAULT_CSV_LIST_MAX_SEGMENT_LEN,
     csv_list_columns: Optional[List[str]] = None,
@@ -3003,14 +3367,18 @@ def process_file(
         confidence: Optional[float] = None
         output_format = "markdown"
         source_xml: Optional[str] = None
+        fm_quality: Optional[str] = None  # frontmatter: resolved quality tier (PDF)
+        fm_page_count: Optional[int] = None  # frontmatter: page count (PDF)
 
         if fmt == "pdf":
             if not deps.get("pdfmux"):
                 raise RuntimeError("pdfmux is not installed; cannot convert PDFs")
             record.converter = "pdfmux"
+            fm_page_count = _pdf_page_count(src)
             eff_quality, q_decision = resolve_quality(
-                quality, _pdf_page_count(src), large_doc_pages
+                quality, fm_page_count, large_doc_pages
             )
+            fm_quality = eff_quality
             if q_decision is not None:  # announce the large-doc fast downgrade
                 _note_auto_decision(record, q_decision)
             # Only the local Docling/pymupdf4llm paths consult the OCR policy; the
@@ -3020,6 +3388,7 @@ def process_file(
             conv = convert_pdf(
                 src, dest, quality=eff_quality, preview_pages=preview_pages,
                 visual_cfg=visual_cfg, clean=clean, strip_patterns=strip_patterns,
+                page_markers=rag_metadata,
             )
             markdown = conv.markdown
             confidence = conv.confidence
@@ -3058,6 +3427,26 @@ def process_file(
                 source_xml = src.read_text(encoding="utf-8", errors="replace")
         elif fmt == "csv":
             record.converter = "csv"
+            # Frontmatter is injected per output file (so every split part keeps
+            # its provenance), not via the central prepend below — CSV returns
+            # early. The closure stamps part/parts once convert_csv knows them.
+            csv_fm: Optional[Callable[[Optional[int], Optional[int]], str]] = None
+            if rag_metadata:
+                csv_src_path = _frontmatter_source_path(src, input_root, source_abspath)
+                csv_mtime = src.stat().st_mtime
+
+                def csv_fm(part, parts, _path=csv_src_path, _mtime=csv_mtime):
+                    return build_frontmatter(
+                        title=_derive_title("", src, "csv"),
+                        source_file=src.name,
+                        source_path=_path,
+                        fmt="csv",
+                        engine="csv",
+                        mtime=_mtime,
+                        part=part,
+                        parts=parts,
+                    )
+
             cc = convert_csv(
                 src, dest,
                 list_min_segments=csv_list_min_segments,
@@ -3066,6 +3455,7 @@ def process_file(
                 skip_columns=csv_skip_columns,
                 title_column=csv_title_column,
                 split_bytes=split_bytes,
+                frontmatter=csv_fm,
             )
             for w in cc.warnings:
                 print("[csv] %s: warning — %s" % (src.name, w), file=sys.stderr)
@@ -3092,6 +3482,33 @@ def process_file(
             )
             record.cleaning = cleaning
             _report_cleaning(record)
+
+        # Prepend YAML provenance frontmatter to Markdown outputs (not .yaml,
+        # whose top-level "---" would start a second YAML document). Done here,
+        # centrally, so every Markdown-producing format gets it identically; the
+        # block is part of the validated string (== on disk) and is stripped
+        # before the fidelity comparison. CSV returns earlier and injects its own
+        # frontmatter per split part (see the csv branch above).
+        if rag_metadata and output_format == "markdown":
+            try:
+                frontmatter = build_frontmatter(
+                    title=_derive_title(markdown, src, fmt),
+                    source_file=src.name,
+                    source_path=_frontmatter_source_path(src, input_root, source_abspath),
+                    fmt=fmt,
+                    engine=record.converter,
+                    mtime=src.stat().st_mtime,
+                    quality=fm_quality,
+                    page_count=fm_page_count,
+                    confidence=confidence,
+                )
+                markdown = frontmatter + "\n\n" + markdown
+                Path(dest).write_text(markdown, encoding="utf-8")
+            except Exception as exc:  # frontmatter must never break a conversion
+                print(
+                    "[meta] %s: skipped frontmatter — %s" % (src.name, exc),
+                    file=sys.stderr,
+                )
 
         record.output_path = str(dest)
         # Web (MHTML / single-file HTML) fidelity is noisier than PDF/DOCX —
@@ -3264,6 +3681,8 @@ def run_batch(
     clean: bool = True,
     strip_patterns: Optional[List[str]] = None,
     used_llm: bool = False,
+    rag_metadata: bool = True,
+    source_abspath: bool = False,
     deps: Optional[Dict[str, bool]] = None,
     csv_list_min_segments: int = DEFAULT_CSV_LIST_MIN_SEGMENTS,
     csv_list_max_segment_len: int = DEFAULT_CSV_LIST_MAX_SEGMENT_LEN,
@@ -3314,6 +3733,8 @@ def run_batch(
                 clean=clean,
                 strip_patterns=strip_patterns,
                 used_llm=used_llm,
+                rag_metadata=rag_metadata,
+                source_abspath=source_abspath,
                 csv_list_min_segments=csv_list_min_segments,
                 csv_list_max_segment_len=csv_list_max_segment_len,
                 csv_list_columns=csv_list_columns,
@@ -3442,6 +3863,21 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="Implies --yaml, and prefixes each nested block with a '# path: ...' "
         "structural breadcrumb so RAG ingesters (e.g. NotebookLM) can locate "
         "deeply-nested blocks. Comments don't change the parsed data.",
+    )
+    parser.add_argument(
+        "--no-rag-metadata", action="store_true",
+        help="Disable RAG provenance metadata (on by default): the YAML "
+        "frontmatter block on every .md output, and '<!-- doc2md:page=N -->' "
+        "page-boundary markers in PDF output where the extractor exposes per-page "
+        "text (omitted when it only returns a single combined blob). Both are "
+        "invisible to humans and stripped before the fidelity check; turn off if "
+        "a downstream tool can't tolerate frontmatter or HTML comments.",
+    )
+    parser.add_argument(
+        "--source-abspath", action="store_true",
+        help="Emit the frontmatter 'source_path' as an absolute path instead of "
+        "relative to the input root. Off by default — relative paths avoid "
+        "leaking machine/folder names into a shared Markdown corpus.",
     )
     parser.add_argument(
         "--preview", action="store_true",
@@ -3598,6 +4034,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         clean=not args.no_clean,
         strip_patterns=args.strip_line,
         used_llm=used_llm,
+        rag_metadata=not args.no_rag_metadata,
+        source_abspath=args.source_abspath,
         deps=deps,
         csv_list_min_segments=args.csv_list_min_segments,
         csv_list_max_segment_len=args.csv_list_max_segment_len,

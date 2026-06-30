@@ -117,6 +117,52 @@ export of a given document:
     are also kept on a single line, since the multi-line plain scalars that
     default line-wrapping produces trip up strict/lightweight YAML parsers.
 
+### Provenance metadata for RAG
+
+By default (disable with `--no-rag-metadata`) every Markdown output carries
+invisible provenance so a retrieved chunk can be traced back to its source —
+without polluting the text or the fidelity score (both layers below are stripped
+before the similarity check, so they never affect validation).
+
+- **YAML frontmatter** — a block at the top of every `.md` file, the citation
+  anchor for retrieved chunks:
+
+  ```yaml
+  ---
+  title: "Network Design Spec"
+  source_file: "network-design-spec.pdf"
+  source_path: "specs/network-design-spec.pdf"
+  format: "pdf"
+  engine: "pdfmux"
+  quality: "standard"
+  page_count: 142
+  confidence: 0.9123
+  converted: "2024-03-02"
+  doc2md_version: "0.2.0"
+  ---
+  ```
+
+  Routing/filtering facts only. `quality`/`page_count`/`confidence` are PDF-only,
+  and `confidence` is omitted when absent so typed loaders (e.g. Pydantic) never
+  meet an unexpected null. `converted` is the **source file's mtime** (not
+  wall-clock now), quoted as a string — so re-converting an unchanged file
+  produces no diff (idempotent, avoids needless re-embeds) and strict schema
+  validators don't choke on a native date. `source_path` is **relative to the
+  input root** by default to avoid leaking machine/folder names into a shared
+  corpus; pass `--source-abspath` for an absolute path. String values are
+  JSON-encoded, which both escapes them and freezes the YAML type (so a title
+  like `NO` or a version like `1.10` can't be coerced to a bool/float).
+
+  **CSV** output gets the same block on **every split part** (`<stem>-partNNN.md`),
+  each additionally stamped `part`/`parts` so an atomic file knows its slice.
+
+- **Page-boundary markers** — `<!-- doc2md:page=N -->` HTML comments at each PDF
+  page boundary, so a chunk's source page survives even after page numbers are
+  stripped from the prose. Emitted only where the extractor exposes per-page
+  text; current pdfmux returns a single combined text blob, so these are
+  presently suppressed (rather than emitting a misleading lone `page=1`) and
+  appear automatically once per-page text is available.
+
 ### Figure & table extraction
 
 The goal is to capture, for grounding, anything that **lacks a faithful Markdown
@@ -129,6 +175,15 @@ representation** — while avoiding image bloat:
 | **Simple tables** (incl. multi-line cells) | Markdown only — multi-line cells become `<br>`, no image |
 | Text, headings, lists, code | Markdown only |
 | **Vector diagrams** (drawn as native shapes) | **opt-in** via `--vector-diagrams` *(see caveat)* |
+
+Figures are placed next to the text of the page they came from **when the
+extractor exposes per-page text**. When it returns a single combined text blob
+for the document (as current pdfmux does), there is no per-page anchor to
+interleave into, so the figures are instead appended **grouped by page** under a
+`## Figures & tables (by page)` heading at the end of the file. Provenance is
+unaffected either way — every block carries its `[Figure — p.N]` label and
+page-stamped alt text — and the placement returns to inline automatically once
+the extractor provides per-page text.
 
 Complex-table blocks put the image reference **immediately before** the
 best-effort Markdown table, with no heading between them, so a structural or
@@ -232,6 +287,8 @@ reprocess generated output.
 | `--xml-mode {auto,verbatim,transform,yaml}` | `auto` | XML handling: `verbatim` (lossless fenced, for config), `transform` (structured Markdown, for doc-XML), `yaml` (structure-preserving `.yaml`), or auto-detect. |
 | `--yaml` | off | Shorthand for `--xml-mode=yaml`: emit XML as YAML (`.yaml`) — fewer tokens than Markdown, round-trip-verified to the source. XML inputs only; takes precedence over `--xml-mode`. |
 | `--yaml-index` | off | Implies `--yaml`, and prefixes each nested block with a `# path: …` structural breadcrumb so RAG ingesters (e.g. NotebookLM) can locate deeply-nested blocks. Comments don't change the parsed data, so round-trip fidelity is unaffected. |
+| `--no-rag-metadata` | off (metadata **on**) | Disable RAG provenance metadata. By default every Markdown output gets a YAML **frontmatter** block (source file, format, engine, page count, confidence, source mtime, version) as a citation anchor for retrieved chunks — including **every CSV split part**, which also carries `part`/`parts` so each atomic file knows its slice. PDF output additionally gets `<!-- doc2md:page=N -->` **page-boundary markers** wherever the extractor exposes per-page text (omitted when it only returns one combined blob). All are invisible to humans and stripped before the fidelity check, so they never affect the similarity score. Turn off if a downstream tool can't tolerate frontmatter or HTML comments. |
+| `--source-abspath` | off | Emit the frontmatter `source_path` as an **absolute** path instead of relative to the input root. Off by default — relative paths avoid leaking machine/folder names into a shared Markdown corpus. |
 | `--preview` | off | Process only the first few pages of each PDF (quick sanity check). |
 | `--preview-pages N` | `3` | Pages to use with `--preview`. |
 
