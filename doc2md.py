@@ -65,8 +65,10 @@ from __future__ import annotations
 import argparse
 import datetime
 import difflib
+import functools
 import json
 import logging
+import multiprocessing
 import os
 import re
 import shutil
@@ -74,7 +76,8 @@ import subprocess
 import sys
 import tempfile
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -91,7 +94,7 @@ except ImportError:  # pragma: no cover - exercised only where PyMuPDF is absent
 # Configuration / defaults
 # --------------------------------------------------------------------------- #
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 # Resolved once and cached. ``None`` when git or the repo is unavailable.
 _GIT_COMMIT_UNSET = object()
@@ -1181,7 +1184,7 @@ def _slice_pdf_pages(src: Path, n_pages: int, dest_dir: Path) -> Path:
 # leaving it ON for scanned / image PDFs that genuinely need it. The decision
 # is made per file from the path passed to each Docling ``convert()`` call, so
 # it stays correct under both pdfmux's internal worker thread and doc2md's own
-# ThreadPoolExecutor — there is no shared mutable selection state to race on.
+# ProcessPoolExecutor — there is no shared mutable selection state to race on.
 
 # A PDF is treated as text-based when at least this share of its non-empty
 # sampled pages carry a real text layer (mirrors pdfmux's own 0.80 digital
@@ -3945,6 +3948,114 @@ def resolve_input(input_path: Path) -> Tuple[Path, List[Path]]:
     return input_path, discover_files(input_path)
 
 
+def _worker_init(ocr_mode: str, pdfmux_available: bool) -> None:
+    """Re-establish the in-process global setup that ``spawn`` workers don't inherit.
+
+    Each worker is a fresh interpreter. Environment variables set in :func:`main`
+    (``PDFMUX_*``, ``TQDM_DISABLE``, …) carry over because the OS inherits the
+    parent's environment at spawn time — but in-memory state does not. The OCR
+    monkey-patches (:func:`install_ocr_policy`) and the third-party log filters
+    (:func:`quiet_third_party_logs`) live only in memory, so without replaying
+    them here a worker would run full-page OCR on born-digital PDFs (the slow
+    path the policy exists to avoid) and leak backend INFO chatter. Both helpers
+    are idempotent and never raise, so a worker init can't break the pool.
+    """
+    quiet_third_party_logs()
+    if pdfmux_available and ocr_mode != "on":
+        install_ocr_policy(ocr_mode)
+
+
+def _crash_record(src: Path, detail: str) -> FileRecord:
+    """A failure record for a file whose worker process died (native crash)."""
+    rec = FileRecord(filename=src.name, source_path=str(src))
+    rec.status = "error"
+    rec.passed = False
+    rec.error = "worker process crashed (likely a native PyMuPDF/MuPDF segfault): %s" % detail
+    return rec
+
+
+def _run_one_isolated(
+    task: Callable[[Path], FileRecord], src: Path, ctx, init_args: Tuple[str, bool]
+) -> FileRecord:
+    """Run one file in its own short-lived process — perfect crash isolation.
+
+    Used to finish survivors after a parallel worker dies (and for ``--workers
+    1``). One process at a time means no two native MuPDF regions ever run
+    concurrently, so the thread/concurrency race can't recur; a file that *still*
+    crashes alone is genuinely poison and gets recorded as an error rather than
+    aborting the batch.
+    """
+    with ProcessPoolExecutor(
+        max_workers=1, mp_context=ctx,
+        initializer=_worker_init, initargs=init_args,
+    ) as pool:
+        fut = pool.submit(task, src)
+        try:
+            return fut.result()
+        except BrokenProcessPool:
+            return _crash_record(src, "crashed when run in isolation")
+        except Exception as exc:  # process_file is meant never to raise; be safe
+            return _crash_record(src, repr(exc))
+
+
+def _run_batch_isolated(
+    files: List[Path],
+    task: Callable[[Path], FileRecord],
+    workers: int,
+    init_args: Tuple[str, bool],
+) -> Dict[Path, FileRecord]:
+    """Convert every file across worker processes, surviving native crashes.
+
+    PyMuPDF/MuPDF and pdfmux's native extractors are not thread-safe and only
+    loosely process-safe: concurrent native work (or a malformed page) can hard
+    crash a worker with SIGSEGV. Each file runs in its own ``spawn`` process so
+    that native state is never shared; when a worker dies the pool raises
+    :class:`BrokenProcessPool`. We salvage the results that already landed, then
+    finish the survivors **serially** (:func:`_run_one_isolated`) so the
+    concurrency race can't recur and one poison document can never abort the run.
+    """
+    ctx = multiprocessing.get_context("spawn")
+    results: Dict[Path, FileRecord] = {}
+    parallel = max(1, workers)
+
+    if parallel > 1:
+        with ProcessPoolExecutor(
+            max_workers=parallel, mp_context=ctx,
+            initializer=_worker_init, initargs=init_args,
+        ) as pool:
+            fut_to_file = {pool.submit(task, f): f for f in files}
+            try:
+                for fut in as_completed(fut_to_file):
+                    f = fut_to_file[fut]
+                    try:
+                        results[f] = fut.result()
+                    except BrokenProcessPool:
+                        break  # pool is dead; salvage + recover below
+                    except Exception as exc:
+                        results[f] = _crash_record(f, repr(exc))
+            except BrokenProcessPool:
+                pass
+        # Salvage any futures that finished before / alongside the crash.
+        for fut, f in fut_to_file.items():
+            if f in results or not fut.done() or fut.cancelled():
+                continue
+            try:
+                results[f] = fut.result()
+            except Exception:
+                pass  # broken/crashed → handled as a survivor below
+
+    survivors = [f for f in files if f not in results]
+    if survivors and parallel > 1:
+        logging.getLogger("doc2md").warning(
+            "a worker process crashed (likely a native PyMuPDF/MuPDF segfault); "
+            "finishing %d remaining file(s) one at a time",
+            len(survivors),
+        )
+    for f in survivors:
+        results[f] = _run_one_isolated(task, f, ctx, init_args)
+    return results
+
+
 def run_batch(
     input_path: Path,
     output_dir: Path,
@@ -3994,40 +4105,41 @@ def run_batch(
     if not files:
         return records
 
-    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
-        futures = {
-            pool.submit(
-                process_file,
-                f,
-                input_root,
-                output_dir,
-                deps=deps,
-                quality=quality,
-                similarity_threshold=similarity_threshold,
-                min_confidence=min_confidence,
-                preview_pages=preview_pages,
-                visual_cfg=visual_cfg,
-                xml_mode=xml_mode,
-                yaml_index=yaml_index,
-                ocr_mode=ocr_mode,
-                large_doc_pages=large_doc_pages,
-                clean=clean,
-                strip_patterns=strip_patterns,
-                used_llm=used_llm,
-                rag_metadata=rag_metadata,
-                source_abspath=source_abspath,
-                csv_list_min_segments=csv_list_min_segments,
-                csv_list_max_segment_len=csv_list_max_segment_len,
-                csv_list_columns=csv_list_columns,
-                csv_skip_columns=csv_skip_columns,
-                csv_title_column=csv_title_column,
-                split_bytes=split_bytes,
-            ): f
-            for f in files
-        }
-        for fut in as_completed(futures):
-            records.append(fut.result())
+    # Each file runs in its own process (spawn). PyMuPDF/MuPDF and pdfmux's
+    # native extractors are not thread-safe and only loosely process-safe — a
+    # threaded pool corrupts MuPDF's shared C state and hard-crashes the
+    # interpreter with a SIGSEGV. Process isolation keeps that state per-file and
+    # lets us survive a worker dying (see :func:`_run_batch_isolated`).
+    task = functools.partial(
+        process_file,
+        input_root=input_root,
+        output_dir=output_dir,
+        deps=deps,
+        quality=quality,
+        similarity_threshold=similarity_threshold,
+        min_confidence=min_confidence,
+        preview_pages=preview_pages,
+        visual_cfg=visual_cfg,
+        xml_mode=xml_mode,
+        yaml_index=yaml_index,
+        ocr_mode=ocr_mode,
+        large_doc_pages=large_doc_pages,
+        clean=clean,
+        strip_patterns=strip_patterns,
+        used_llm=used_llm,
+        rag_metadata=rag_metadata,
+        source_abspath=source_abspath,
+        csv_list_min_segments=csv_list_min_segments,
+        csv_list_max_segment_len=csv_list_max_segment_len,
+        csv_list_columns=csv_list_columns,
+        csv_skip_columns=csv_skip_columns,
+        csv_title_column=csv_title_column,
+        split_bytes=split_bytes,
+    )
+    init_args = (ocr_mode, bool(deps.get("pdfmux")))
+    results = _run_batch_isolated(files, task, workers, init_args)
 
+    records = list(results.values())
     records.sort(key=lambda r: r.source_path)
     return records
 
