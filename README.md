@@ -237,6 +237,10 @@ and review the output.
 
 ## Requirements
 
+> **Just want to get running?** See **[INSTALL.md](INSTALL.md)** for copy-paste
+> setup recipes (macOS with/without Homebrew, Ubuntu, and `uv`). The tables below
+> are the reference for *what* each dependency is and *why*.
+
 ### Python packages (`requirements.txt`)
 
 | Dependency | Used for |
