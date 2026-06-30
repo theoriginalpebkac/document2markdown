@@ -46,6 +46,7 @@ so they can be imported and unit-tested on their own.
 | **Single-file HTML** (incl. a Jira/Confluence "Save as Word" page named `.doc`/`.htm`) | de-chrome + inline `data:` figures → pandoc | sniffed by content, not extension; UI icons filtered |
 | **Config XML** (syntax-critical) | **verbatim** — fenced ```xml``` + generated index | lossless; exact tags/attributes/values preserved |
 | **Config XML → YAML** (opt-in `--yaml`) | structure-preserving YAML (`.yaml`) | lower-token grounding for LLMs; round-trip-verified against the source XML; add `--yaml-index` for RAG-locatable breadcrumbs |
+| **Config XML → RAG-optimized YAML** (opt-in `--rag`) | flattened path-qualified variant (`.rag.txt`) | grounding LLMs can trust under naive vector chunking: summary of origins+variables plus one self-contained `path = value` line per leaf, so retrieval stays accurate even when chunks split the file; value-level fidelity |
 | **Documentation XML** | **transform** — structured Markdown (headings/lists) | for XML that is really a document |
 | EPUB / RTF / ODT | pandoc | |
 | legacy binary `.doc` (OLE) | — | not supported; re-save as `.docx` or export PDF |
@@ -116,6 +117,23 @@ export of a given document:
     plain `--yaml` output. Long plain scalars (e.g. space-separated IP/CIDR lists)
     are also kept on a single line, since the multi-line plain scalars that
     default line-wrapping produces trip up strict/lightweight YAML parsers.
+  - For maximum retrieval accuracy in a RAG pipeline, pass **`--rag`** to emit a
+    **RAG-optimized variant of the YAML** (`.rag.txt`) tuned for how LLMs actually
+    retrieve config. Breadcrumb comments only anchor a block's top, so when a
+    chunk window splits the block the later leaves are re-orphaned and embedders
+    down-weight the comment tokens. `--rag` reshapes the same data so every line
+    answers for itself: a deterministic **DOCUMENT SUMMARY** (origin hostnames +
+    every variable's value — the facts that take whole-document context to answer)
+    followed by one fully path-qualified `a > b(value=…) > c = value` line **per
+    leaf**. The hierarchy becomes *content* rather than a comment, so each line
+    stands alone no matter where a chunk boundary lands and a conditional override
+    (e.g. a failover origin) carries its match path inline — which is what makes
+    it grounding LLMs can trust under naive vector chunking. It's a retrieval
+    *projection*, not the structured source of truth: it reshapes the YAML for
+    ingestion rather than round-tripping back to it (use `--yaml` when you need
+    the round-trippable form), so fidelity is verified at the value level instead
+    — every source leaf must appear in the output. XML only; the `.rag.txt` is
+    ingested directly by tools like NotebookLM.
 
 ### Provenance metadata for RAG
 
@@ -293,9 +311,10 @@ reprocess generated output.
 | `--strip-line REGEX` | — | During cleanup (any format), also remove lines that *fully* match REGEX — for document/corpus-specific header/footer chrome (company names, confidentiality notices, running titles) that can't be detected automatically. Repeatable. Still verified lossless. |
 | `--vector-diagrams` | off | Best-effort vector-diagram extraction (see caveat). |
 | `--figure-dpi N` | `150` | Render DPI for extracted PNGs. |
-| `--xml-mode {auto,verbatim,transform,yaml}` | `auto` | XML handling: `verbatim` (lossless fenced, for config), `transform` (structured Markdown, for doc-XML), `yaml` (structure-preserving `.yaml`), or auto-detect. |
+| `--xml-mode {auto,verbatim,transform,yaml,rag}` | `auto` | XML handling: `verbatim` (lossless fenced, for config), `transform` (structured Markdown, for doc-XML), `yaml` (structure-preserving `.yaml`), `rag` (flattened `.rag.txt` index, see `--rag`), or auto-detect. |
 | `--yaml` | off | Shorthand for `--xml-mode=yaml`: emit XML as YAML (`.yaml`) — fewer tokens than Markdown, round-trip-verified to the source. XML inputs only; takes precedence over `--xml-mode`. |
 | `--yaml-index` | off | Implies `--yaml`, and prefixes each nested block with a `# path: …` structural breadcrumb so RAG ingesters (e.g. NotebookLM) can locate deeply-nested blocks. Comments don't change the parsed data, so round-trip fidelity is unaffected. |
+| `--rag` | off | Convert config XML to a RAG-optimized variant of the YAML (`.rag.txt`) tuned for LLM retrieval: a deterministic summary (origins + variables) plus one fully path-qualified `a > b > c = value` line per leaf, so every line stays accurate even when a RAG chunk splits the file. A retrieval projection rather than the round-trippable source — use `--yaml` for that; fidelity is checked at the value level. XML inputs only. |
 | `--no-rag-metadata` | off (metadata **on**) | Disable RAG provenance metadata. By default every Markdown output gets a YAML **frontmatter** block (source file, format, engine, page count, confidence, source mtime, version) as a citation anchor for retrieved chunks — including **every CSV split part**, which also carries `part`/`parts` so each atomic file knows its slice. PDF output additionally gets `<!-- doc2md:page=N -->` **page-boundary markers** wherever the extractor exposes per-page text (omitted when it only returns one combined blob). All are invisible to humans and stripped before the fidelity check, so they never affect the similarity score. Turn off if a downstream tool can't tolerate frontmatter or HTML comments. |
 | `--source-abspath` | off | Emit the frontmatter `source_path` as an **absolute** path instead of relative to the input root. Off by default — relative paths avoid leaking machine/folder names into a shared Markdown corpus. |
 | `--preview` | off | Process only the first few pages of each PDF (quick sanity check). |

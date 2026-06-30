@@ -13,3 +13,8 @@ venv/
 /markdown/
 conversion_report.json
 *_figures/
+
+# Local-only tests: realistic vendor-shaped (sanitized) config fixtures we keep
+# out of the public repo — e.g. Akamai Property Manager metadata XML. The
+# committed suite stays vendor-neutral; run these with `pytest tests/local/`.
+tests/local/
