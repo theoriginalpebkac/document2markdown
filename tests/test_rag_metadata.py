@@ -128,6 +128,72 @@ def test_frontmatter_norway_title_stays_string():
 
 
 # --------------------------------------------------------------------------- #
+# Version + commit provenance: the regeneration audit key
+# --------------------------------------------------------------------------- #
+
+
+def _fm(monkeypatch, commit):
+    """Frontmatter dict with ``git_commit`` pinned to ``commit``."""
+    monkeypatch.setattr(doc2md, "git_commit", lambda: commit)
+    return _parse_frontmatter(doc2md.build_frontmatter(
+        title="T", source_file="s.pdf", source_path="s.pdf", fmt="pdf",
+        engine="pdfmux", mtime=0.0,
+    ))
+
+
+def test_frontmatter_stamps_commit_when_available(monkeypatch):
+    data = _fm(monkeypatch, "abc1234")
+    assert data["doc2md_version"] == doc2md.__version__
+    assert data["doc2md_commit"] == "abc1234"
+
+
+def test_frontmatter_carries_dirty_marker(monkeypatch):
+    # A doc built from an uncommitted tree is flagged non-reproducible.
+    assert _fm(monkeypatch, "abc1234-dirty")["doc2md_commit"] == "abc1234-dirty"
+
+
+def test_frontmatter_omits_commit_outside_a_repo(monkeypatch):
+    # No git / not a checkout -> commit key simply absent (version still stamped).
+    data = _fm(monkeypatch, None)
+    assert "doc2md_commit" not in data
+    assert data["doc2md_version"] == doc2md.__version__
+
+
+def test_yaml_provenance_header_is_comment_only(monkeypatch):
+    # YAML can't carry "---" frontmatter, so provenance rides as leading comments
+    # that parse away cleanly and never start a second YAML document.
+    monkeypatch.setattr(doc2md, "git_commit", lambda: "abc1234")
+    header = doc2md.yaml_provenance_header()
+    assert header.endswith("\n")
+    assert all(line.startswith("#") for line in header.splitlines())
+    assert "doc2md_version: %s" % doc2md.__version__ in header
+    assert "doc2md_commit: abc1234" in header
+    assert yaml.safe_load(header + "config:\n  a: 1\n") == {"config": {"a": 1}}
+
+
+def test_yaml_provenance_header_omits_commit_outside_a_repo(monkeypatch):
+    monkeypatch.setattr(doc2md, "git_commit", lambda: None)
+    header = doc2md.yaml_provenance_header()
+    assert "doc2md_commit" not in header
+    assert "doc2md_version" in header
+
+
+def test_git_commit_result_is_cached(monkeypatch):
+    # Detection runs at most once per process; callers hit the cache thereafter.
+    calls = {"n": 0}
+
+    def fake_run(*a, **k):
+        calls["n"] += 1
+        raise OSError("git missing")
+
+    monkeypatch.setattr(doc2md, "_git_commit_cache", doc2md._GIT_COMMIT_UNSET)
+    monkeypatch.setattr(doc2md.subprocess, "run", fake_run)
+    assert doc2md.git_commit() is None
+    assert doc2md.git_commit() is None
+    assert calls["n"] == 1
+
+
+# --------------------------------------------------------------------------- #
 # Page-marker assembly
 # --------------------------------------------------------------------------- #
 
