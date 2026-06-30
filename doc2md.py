@@ -95,7 +95,7 @@ except ImportError:  # pragma: no cover - exercised only where PyMuPDF is absent
 # Configuration / defaults
 # --------------------------------------------------------------------------- #
 
-__version__ = "0.7.0"
+__version__ = "0.8.0"
 
 # Resolved once and cached. ``None`` when git or the repo is unavailable.
 _GIT_COMMIT_UNSET = object()
@@ -381,8 +381,8 @@ def check_dependencies(*, need_yaml: bool = False) -> Dict[str, bool]:
         available["xmltodict"] = importlib.util.find_spec("xmltodict") is not None
         available["yaml"] = importlib.util.find_spec("yaml") is not None
         instructions["xmltodict"] = instructions["yaml"] = (
-            "--yaml needs the 'xmltodict' and 'PyYAML' packages, which are not "
-            "importable.\n"
+            "--yaml/--rag need the 'xmltodict' and 'PyYAML' packages, which are "
+            "not importable.\n"
             "    Install them with:  pip install -r requirements.txt"
         )
 
@@ -2615,15 +2615,190 @@ def xml_to_yaml(raw: str, index: bool = False) -> str:
     return _yaml_breadcrumbs(dumped) if index else dumped
 
 
+# --------------------------------------------------------------------------- #
+# XML -> RAG-optimized flat index (--rag)
+# --------------------------------------------------------------------------- #
+#
+# --yaml/--yaml-index emit *valid, round-trippable* YAML; great for fidelity, but
+# a chunk-based RAG ingester (NotebookLM) splits a large config into fixed-size
+# windows and a deeply-nested leaf gets stripped of its ancestor keys — it "looks
+# in the wrong place." --yaml-index restores context with `# path:` *comments*,
+# but a comment only anchors a block's top: if the window splits the block, every
+# later leaf is re-orphaned, and embedders down-weight comment tokens anyway.
+#
+# --rag instead emits one fully path-qualified `a > b > c = value` line per leaf:
+# the complete ancestor path is *content*, not a comment, so every line stands
+# alone regardless of where a chunk boundary falls, and the path tokens
+# embed/keyword-match. A deterministic DOCUMENT SUMMARY (origins + variables) is
+# prepended for facts that need whole-document aggregation to answer. This is a
+# *projection*, NOT valid YAML and NOT round-trippable — use --yaml for that.
+# Fidelity is instead checked at the value level (every source leaf present); see
+# :func:`rag_fidelity_check`.
+
+# Discriminator keys as they appear in the xmltodict-parsed dict (raw/unquoted) —
+# the same set :func:`_yaml_breadcrumbs` matches in dumped YAML (_YAML_DISC_KEYS).
+_RAG_DISC_KEYS = ("@value", "@name", "@result", "@field", "name")
+_RAG_SEP = " > "
+
+
+def _rag_discriminator(node: Any) -> Tuple[Optional[str], Optional[str]]:
+    """``(key, "key=value")`` discriminator for a mapping node, else ``(None, None)``.
+
+    Mirrors the discriminator capture in :func:`_yaml_breadcrumbs`: a node is
+    identified by its first present ``@value``/``@name``/``@result``/``@field``/
+    ``name`` scalar so repeated keys (``match:request.type`` …) don't collide
+    along a path. Booleans are skipped (they aren't config identities).
+    """
+    if not isinstance(node, dict):
+        return None, None
+    for k in _RAG_DISC_KEYS:
+        v = node.get(k)
+        if isinstance(v, (str, int, float)) and not isinstance(v, bool) and str(v) != "":
+            return k, "%s=%s" % (k.lstrip("@"), v)
+    return None, None
+
+
+def _rag_leaf_value(node: Any) -> str:
+    """One-line rendering of a leaf scalar: internal whitespace/newlines collapsed
+    so every emitted line stays a single self-contained record (a rare multi-line
+    comment value would otherwise span lines and break per-leaf grounding)."""
+    if node is None:
+        return ""
+    return " ".join(str(node).split())
+
+
+def _rag_flatten(node: Any, path: List[str], out: List[str]) -> None:
+    """Append one ``a > b > c = value`` line per leaf scalar under ``node``.
+
+    Lists share their owning key's path; each item re-derives its own
+    discriminator so siblings don't blur together. The key chosen as a node's
+    discriminator is folded into the path segment and not re-emitted as its own
+    leaf (that would just duplicate the segment).
+    """
+    if isinstance(node, dict):
+        dkey, dsuf = _rag_discriminator(node)
+        if path:
+            seg = path[-1] + ("(%s)" % dsuf if dsuf else "")
+            here = path[:-1] + [seg]
+        else:
+            here = path
+        before = len(out)
+        for k, v in node.items():
+            if k == dkey:
+                continue  # folded into the segment; re-emitting under a sibling is noise
+            _rag_flatten(v, here + [k], out)
+        if dkey is not None and len(out) == before:
+            # The discriminator was this node's ONLY content (e.g. a bare
+            # ``comment:note`` ``@value``); with no sibling leaf to carry it, emit
+            # it directly so the value isn't lost (rag_fidelity_check enforces this).
+            out.append("%s = %s" % (_RAG_SEP.join(here), _rag_leaf_value(node[dkey])))
+    elif isinstance(node, list):
+        for item in node:
+            _rag_flatten(item, path, out)
+    else:
+        out.append("%s = %s" % (_RAG_SEP.join(path), _rag_leaf_value(node)))
+
+
+def _rag_manifest(parsed: Any) -> str:
+    """Deterministic DOCUMENT SUMMARY: facts that need whole-document aggregation.
+
+    Scoped to exactly that — origin hostnames (gathered from every forward block)
+    and ``assign:variable`` name→value definitions (scattered across the config).
+    Local, single-location facts (ports, individual match rules) are already
+    answered by the flattened leaves, so duplicating them here would only bloat
+    and drift. Conditional *logic* (failover triggers) is intentionally deferred
+    to a future opt-in ``--llm`` prose tier.
+    """
+    origins: List[str] = []
+    seen: set = set()
+    variables: List[Tuple[str, Any]] = []
+
+    def emit_origin(h: Any) -> None:
+        if isinstance(h, str) and h and h not in seen:
+            seen.add(h)
+            origins.append(h)
+
+    def rec(node: Any) -> None:
+        if isinstance(node, dict):
+            for k, v in node.items():
+                if k.startswith("forward:origin-server") or k == "forward:modify-host-header":
+                    for item in (v if isinstance(v, list) else [v]):
+                        if isinstance(item, dict):
+                            emit_origin(item.get("host"))
+                            emit_origin(item.get("value"))
+                            dns = item.get("dns-name")
+                            if isinstance(dns, dict):
+                                emit_origin(dns.get("value"))
+                if k == "assign:variable":
+                    for item in (v if isinstance(v, list) else [v]):
+                        if isinstance(item, dict) and isinstance(item.get("name"), str):
+                            variables.append((item["name"], item.get("value")))
+                rec(v)
+        elif isinstance(node, list):
+            for item in node:
+                rec(item)
+
+    rec(parsed)
+    lines = ["# DOCUMENT SUMMARY (deterministic; derived from this config)", ""]
+    lines.append("## Origin hostnames referenced in this property")
+    for h in origins:
+        lines.append("- This property forwards to origin host: %s" % h)
+    if not origins:
+        lines.append("- (none found)")
+    lines.append("")
+    lines.append("## Variables defined in this property (name = value)")
+    for name, val in variables:
+        lines.append("- Variable %s is set to: %s" % (name, _rag_leaf_value(val)))
+    if not variables:
+        lines.append("- (none found)")
+    return "\n".join(lines)
+
+
+def xml_to_rag(raw: str) -> str:
+    """Convert config XML to a RAG-optimized flat index (NOT valid YAML).
+
+    Emits a deterministic :func:`_rag_manifest` summary followed by one fully
+    path-qualified ``a > b > c = value`` line per leaf scalar (:func:`_rag_flatten`)
+    — a retrieval *projection* for chunk-based ingesters where each line must
+    stand alone. Unlike :func:`xml_to_yaml` it does **not** round-trip to the
+    source structure; value-level fidelity is verifiable instead (every source
+    leaf appears — :func:`rag_fidelity_check`).
+
+    Shares ``xml_to_yaml``'s parse (``xmltodict`` + positioned ``_comment`` nodes)
+    so comments and namespaces are carried. Raises ``RuntimeError`` if the
+    optional ``xmltodict`` package is missing; propagates ``expat.ExpatError`` on
+    malformed XML so the caller can fall back to lossless Markdown.
+    """
+    try:
+        import xmltodict
+    except ImportError as exc:
+        raise RuntimeError(
+            "--rag needs the 'xmltodict' and 'PyYAML' packages; "
+            "install them with:  pip install -r requirements.txt"
+        ) from exc
+
+    parsed = xmltodict.parse(_xml_comments_to_elements(raw))
+    leaves: List[str] = []
+    _rag_flatten(parsed, [], leaves)
+    return "".join([
+        _rag_manifest(parsed),
+        "\n\n# FLATTENED CONFIGURATION (path-qualified leaves)\n\n",
+        "\n".join(leaves),
+        "\n",
+    ])
+
+
 def convert_xml(
     src: Path, dest: Path, mode: str = "auto", yaml_index: bool = False
 ) -> Tuple[str, str, Path]:
-    """Convert XML to Markdown or YAML. ``mode`` is auto | verbatim | transform | yaml.
+    """Convert XML to Markdown, YAML, or a RAG index. ``mode`` is
+    auto | verbatim | transform | yaml | rag.
 
     Returns ``(content, mode_used, dest_written)``. Verbatim is lossless and the
     safe default for unknown/config XML; transform is for documentation-style XML;
-    yaml emits structure-preserving YAML to a sibling ``.yaml`` file (the output
-    path differs from the ``.md`` ``dest`` passed in, hence the returned path).
+    yaml emits structure-preserving YAML to a sibling ``.yaml`` file; rag emits a
+    flattened path-qualified index to a sibling ``.rag.txt`` (the output path
+    differs from the ``.md`` ``dest`` passed in, hence the returned path).
     ``yaml_index`` adds structural-path breadcrumbs to the YAML for RAG retrieval.
 
     A ``yaml`` request on malformed XML falls back to lossless ``verbatim``
@@ -2643,6 +2818,17 @@ def convert_xml(
             yaml_dest.parent.mkdir(parents=True, exist_ok=True)
             yaml_dest.write_text(content, encoding="utf-8")
             return content, "yaml", yaml_dest
+    if chosen == "rag":
+        try:
+            content = xml_to_rag(raw)
+        except xml.parsers.expat.ExpatError:
+            chosen = "verbatim"  # malformed XML -> lossless Markdown fallback
+        else:
+            # Not YAML: a sibling ``.rag.txt`` (NotebookLM ingests .txt directly).
+            rag_dest = dest.parent / (dest.stem + ".rag.txt")
+            rag_dest.parent.mkdir(parents=True, exist_ok=True)
+            rag_dest.write_text(content, encoding="utf-8")
+            return content, "rag", rag_dest
     if chosen == "transform":
         try:
             markdown = xml_to_markdown_transform(src, raw)
@@ -3374,6 +3560,69 @@ def yaml_structural_check(content: str) -> Tuple[Dict[str, int], bool, Optional[
     return {"keys": keys}, True, None
 
 
+def rag_structural_check(content: str) -> Tuple[Dict[str, int], bool, Optional[str]]:
+    """Structural validity for ``--rag`` output: a summary block + ≥1 leaf line.
+
+    The flattened index isn't YAML, so :func:`yaml_structural_check` doesn't apply.
+    A valid index has the deterministic DOCUMENT SUMMARY header and at least one
+    path-qualified ``… = value`` leaf. Returns ``(counts, ok, reason)`` mirroring
+    the other structural checks' shape.
+    """
+    has_summary = "# DOCUMENT SUMMARY" in content
+    leaves = sum(1 for ln in content.splitlines() if " = " in ln)
+    ok = has_summary and leaves > 0
+    reason = None if ok else "RAG output missing summary or path-qualified leaves"
+    return {"leaves": leaves}, ok, reason
+
+
+def _collect_xml_scalars(node: Any, out: List[str]) -> None:
+    """Gather every scalar leaf value from an xmltodict parse (recursively)."""
+    if isinstance(node, dict):
+        for v in node.values():
+            _collect_xml_scalars(v, out)
+    elif isinstance(node, list):
+        for v in node:
+            _collect_xml_scalars(v, out)
+    elif node is not None:
+        out.append(str(node))
+
+
+def rag_fidelity_check(
+    content: str, source_xml: Optional[str]
+) -> Tuple[Optional[bool], Optional[str]]:
+    """Value-level fidelity for ``--rag`` output: every source leaf value present.
+
+    The flattened index intentionally does NOT round-trip to the source structure
+    (unlike :func:`yaml_fidelity_check`), so fidelity is verified at the value
+    level instead: collect every scalar leaf from the source XML and require each
+    to appear in the emitted text (whitespace-normalized to match
+    :func:`_rag_leaf_value`'s one-line rendering). A miss means the flattener
+    dropped a leaf. Returns ``(None, None)`` when no source is available.
+    """
+    if source_xml is None:
+        return None, None
+    try:
+        import xmltodict
+
+        expected = xmltodict.parse(_xml_comments_to_elements(source_xml))
+    except Exception as exc:  # noqa: BLE001 - any failure means we can't vouch for it
+        return False, "could not verify RAG fidelity: %s" % exc
+    scalars: List[str] = []
+    _collect_xml_scalars(expected, scalars)
+    norm_content = " ".join(content.split())
+    missing = []
+    for s in scalars:
+        norm = " ".join(s.split())
+        if norm and norm not in norm_content:
+            missing.append(s)
+    if missing:
+        sample = ", ".join(repr(s) for s in missing[:3])
+        return False, "%d source value(s) missing from RAG output (e.g. %s)" % (
+            len(missing), sample,
+        )
+    return True, None
+
+
 def yaml_fidelity_check(
     yaml_content: str, source_xml: Optional[str]
 ) -> Tuple[Optional[bool], Optional[str]]:
@@ -3445,13 +3694,19 @@ def validate(
     ``--yaml`` output legitimately has no headings/tables/code fences. When
     ``source_xml`` is also supplied, the YAML is additionally verified to
     round-trip to the source XML's structure (``fidelity_ok``); a mismatch fails
-    the document.
+    the document. ``output_format="rag"`` (the ``--rag`` flat index) instead
+    checks for a summary block plus path-qualified leaves, and verifies fidelity
+    at the value level — every source leaf must appear (it deliberately does not
+    round-trip).
     """
     fidelity_ok: Optional[bool] = None
     fidelity_reason: Optional[str] = None
     if output_format == "yaml":
         counts, struct_ok, struct_reason = yaml_structural_check(markdown)
         fidelity_ok, fidelity_reason = yaml_fidelity_check(markdown, source_xml)
+    elif output_format == "rag":
+        counts, struct_ok, struct_reason = rag_structural_check(markdown)
+        fidelity_ok, fidelity_reason = rag_fidelity_check(markdown, source_xml)
     else:
         counts = structural_counts(markdown)
         plain = strip_markdown(markdown)
@@ -3723,10 +3978,10 @@ def process_file(
                     "setting": "xml-mode",
                     "choice": mode_used,
                     "reason": "auto: chosen by content sniffing",
-                    "override": "--xml-mode verbatim|transform|yaml (or --yaml)",
+                    "override": "--xml-mode verbatim|transform|yaml|rag (or --yaml/--rag)",
                 })
-            output_format = "yaml" if mode_used == "yaml" else "markdown"
-            if output_format == "yaml":
+            output_format = {"yaml": "yaml", "rag": "rag"}.get(mode_used, "markdown")
+            if output_format in ("yaml", "rag"):
                 source_xml = src.read_text(encoding="utf-8", errors="replace")
         elif fmt == "csv":
             record.converter = "csv"
@@ -3813,13 +4068,14 @@ def process_file(
                     "[meta] %s: skipped frontmatter — %s" % (src.name, exc),
                     file=sys.stderr,
                 )
-        elif rag_metadata and output_format == "yaml":
+        elif rag_metadata and output_format in ("yaml", "rag"):
             try:
                 markdown = yaml_provenance_header() + markdown
                 Path(dest).write_text(markdown, encoding="utf-8")
             except Exception as exc:  # provenance must never break a conversion
                 print(
-                    "[meta] %s: skipped yaml provenance — %s" % (src.name, exc),
+                    "[meta] %s: skipped %s provenance — %s"
+                    % (src.name, output_format, exc),
                     file=sys.stderr,
                 )
 
@@ -4268,11 +4524,14 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="Render DPI for extracted PNGs (default: %d)" % DEFAULT_FIGURE_DPI,
     )
     parser.add_argument(
-        "--xml-mode", choices=("auto", "verbatim", "transform", "yaml"), default="auto",
+        "--xml-mode", choices=("auto", "verbatim", "transform", "yaml", "rag"),
+        default="auto",
         help="XML handling: 'verbatim' (fenced, lossless — for syntax-critical "
         "config), 'transform' (structured Markdown — for documentation XML), "
         "'yaml' (structure-preserving YAML to a .yaml file — low-token, parser- "
-        "friendly for LLM/RAG ingestion), or 'auto' (default: detect by content).",
+        "friendly for LLM/RAG ingestion), 'rag' (flattened '.rag.txt' index for "
+        "chunk-based retrieval — see --rag), or 'auto' (default: detect by "
+        "content).",
     )
     parser.add_argument(
         "--yaml", action="store_true",
@@ -4285,6 +4544,14 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="Implies --yaml, and prefixes each nested block with a '# path: ...' "
         "structural breadcrumb so RAG ingesters (e.g. NotebookLM) can locate "
         "deeply-nested blocks. Comments don't change the parsed data.",
+    )
+    parser.add_argument(
+        "--rag", action="store_true",
+        help="Convert config XML to a RAG-optimized flat index ('.rag.txt'): a "
+        "deterministic summary (origins + variables) plus one fully "
+        "path-qualified 'a > b > c = value' line per leaf, so every line "
+        "survives chunk-based retrieval (e.g. NotebookLM). NOT valid YAML and "
+        "not round-trippable — use --yaml for the structured form. XML only.",
     )
     parser.add_argument(
         "--no-rag-metadata", action="store_true",
@@ -4367,8 +4634,13 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     output_dir.mkdir(parents=True, exist_ok=True)
     quiet_third_party_logs()  # before any backend imports, so env/filters take
-    xml_mode = "yaml" if (args.yaml or args.yaml_index) else args.xml_mode
-    deps = check_dependencies(need_yaml=xml_mode == "yaml")
+    if args.rag:
+        xml_mode = "rag"
+    elif args.yaml or args.yaml_index:
+        xml_mode = "yaml"
+    else:
+        xml_mode = args.xml_mode
+    deps = check_dependencies(need_yaml=xml_mode in ("yaml", "rag"))
     if not any(deps.values()):
         print(
             "error: none of pdfmux / pandoc / pdftotext are available; nothing "
