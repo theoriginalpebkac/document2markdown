@@ -63,6 +63,7 @@ pipeline on that slice. Visuals are extracted from the same slice.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime
 import difflib
 import functools
@@ -94,7 +95,7 @@ except ImportError:  # pragma: no cover - exercised only where PyMuPDF is absent
 # Configuration / defaults
 # --------------------------------------------------------------------------- #
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 
 # Resolved once and cached. ``None`` when git or the repo is unavailable.
 _GIT_COMMIT_UNSET = object()
@@ -958,6 +959,33 @@ def _alt_text(doc_title: str, kind: str, page_index: int, caption: Optional[str]
     return base + (": " + caption if caption else "")
 
 
+@contextlib.contextmanager
+def _classic_table_detection():
+    """Force PyMuPDF's deterministic line-based table finder for our visual pass.
+
+    PyMuPDF 1.28+ ships an ONNX "layout" analyzer. When pdfmux/pymupdf4llm is in
+    the process it installs that analyzer globally as ``pymupdf._get_layout``
+    (just importing ``pymupdf4llm`` is enough), and ``Page.find_tables()`` then
+    routes through it. On some PDFs that native path **segfaults** inside MuPDF
+    (``fz_table_hunt_within_bounds``) — an uncatchable crash that no ``try`` can
+    stop. doc2md's figure pass only needs geometric table *regions* (to extract
+    genuinely-complex tables and mask them out of diagram detection), which the
+    classic line-based detector provides and was calibrated against. So we
+    disable the layout analyzer just around our own ``find_tables()`` call and
+    restore it after — pdfmux's extraction keeps using layout mode for its own
+    Markdown. No-op on PyMuPDF builds without the layout hook.
+    """
+    if pymupdf is None or not hasattr(pymupdf, "_get_layout"):
+        yield
+        return
+    saved = pymupdf._get_layout
+    pymupdf._get_layout = None
+    try:
+        yield
+    finally:
+        pymupdf._get_layout = saved
+
+
 def extract_page_visuals(
     page,
     page_index: int,
@@ -1001,7 +1029,8 @@ def extract_page_visuals(
     table_objs = []
     if cfg.extract_tables or cfg.extract_diagrams:
         try:
-            table_objs = list(page.find_tables().tables)
+            with _classic_table_detection():
+                table_objs = list(page.find_tables().tables)
         except Exception:
             table_objs = []
     # PyMuPDF's ``Table.bbox`` raises ValueError("min() iterable argument is
