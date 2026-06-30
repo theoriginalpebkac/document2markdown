@@ -91,7 +91,7 @@ except ImportError:  # pragma: no cover - exercised only where PyMuPDF is absent
 # Configuration / defaults
 # --------------------------------------------------------------------------- #
 
-__version__ = "0.4.1"
+__version__ = "0.5.0"
 
 # Resolved once and cached. ``None`` when git or the repo is unavailable.
 _GIT_COMMIT_UNSET = object()
@@ -99,8 +99,8 @@ _git_commit_cache: object = _GIT_COMMIT_UNSET
 
 
 def git_commit() -> Optional[str]:
-    """Short commit hash of the doc2md.py checkout (``-dirty`` when the working
-    tree has uncommitted changes), or ``None`` if git/the repo is unavailable.
+    """Short commit hash of the doc2md.py checkout (``-dirty`` when doc2md.py
+    itself has uncommitted changes), or ``None`` if git/the repo is unavailable.
 
     Stamped into every output's provenance alongside ``__version__``. The SHA is
     the *precise* regeneration key — it pins the exact code with no manual
@@ -113,7 +113,8 @@ def git_commit() -> Optional[str]:
     if _git_commit_cache is not _GIT_COMMIT_UNSET:
         return _git_commit_cache  # type: ignore[return-value]
     _git_commit_cache = None
-    repo = str(Path(__file__).resolve().parent)
+    self_path = Path(__file__).resolve()
+    repo = str(self_path.parent)
     try:
         rev = subprocess.run(
             ["git", "-C", repo, "rev-parse", "--short", "HEAD"],
@@ -124,8 +125,12 @@ def git_commit() -> Optional[str]:
         sha = rev.stdout.strip()
         if not sha:
             return None
+        # Scope the dirty check to doc2md.py itself, not the whole tree: it is the
+        # only file the SHA is meant to pin, so a dirty README/sibling shouldn't
+        # mark the *code* as -dirty — and a path-scoped status skips the full-tree
+        # walk that can blow the timeout when doc2md.py is vendored in a monorepo.
         dirty = subprocess.run(
-            ["git", "-C", repo, "status", "--porcelain"],
+            ["git", "-C", repo, "status", "--porcelain", "--", str(self_path)],
             capture_output=True, text=True, timeout=5,
         )
         if dirty.returncode == 0 and dirty.stdout.strip():
