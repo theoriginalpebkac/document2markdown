@@ -91,7 +91,7 @@ except ImportError:  # pragma: no cover - exercised only where PyMuPDF is absent
 # Configuration / defaults
 # --------------------------------------------------------------------------- #
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 DEFAULT_WORKERS = 4
 DEFAULT_SIMILARITY_THRESHOLD = 0.90
@@ -225,6 +225,8 @@ class PdfConversion:
     min_page_confidence: Optional[float]
     visuals: List[Visual] = field(default_factory=list)
     cleaning: Dict[str, object] = field(default_factory=dict)
+    page_source: str = "process-fallback"  # see :func:`_extract_pdf_pages`
+    page_markers_applied: bool = False  # were page-boundary markers woven in
 
 
 @dataclass
@@ -993,12 +995,13 @@ def build_markdown_with_visuals(
     * Per-page (``len(pages_text) > 1``): each page's visuals are interleaved
       right after that page's text, and — with ``mark_pages`` — a
       ``<!-- doc2md:page=N -->`` marker is woven in at every page boundary.
-    * Single combined blob: there is no per-page anchor to interleave into, so
-      visuals are appended **grouped by page** under a heading at the end of the
-      document. Provenance survives via each block's ``[Figure — p.N]`` label and
-      page-stamped alt text; only inline placement is degraded, and that
-      self-heals once pdfmux exposes per-page text again. Page markers are
-      suppressed here for the same reason (a lone ``page=1`` would mislead).
+    * Single combined blob (the Docling-table / LLM ``process()`` paths — see
+      :func:`_extract_pdf_pages`): there is no per-page anchor to interleave
+      into, so visuals are appended **grouped by page** under a heading at the
+      end of the document. Provenance survives via each block's ``[Figure —
+      p.N]`` label and page-stamped alt text; only inline placement is degraded.
+      Page markers are suppressed here for the same reason (a lone ``page=1``
+      would mislead).
     """
     visuals_enabled = cfg.enabled and pymupdf is not None
     have_per_page_text = len(pages_text) > 1
@@ -1387,12 +1390,84 @@ def install_ocr_policy(mode: str) -> None:
         )
 
 
-def _extract_pdf_pages(src: Path, quality: str) -> Tuple[List[Tuple[int, str]], Optional[float], Optional[float]]:
-    """Run pdfmux and return per-page (index, text), doc confidence, min-page confidence.
+def _pdf_routes_to_docling(src: Path) -> bool:
+    """True if pdfmux's router would push this PDF through the Docling table path.
 
-    Prefers ``pdfmux.pipeline.process`` (gives per-page text + confidence). Falls
-    back to public ``pdfmux.extract_text`` (single blob, no confidence) only if
-    the internal module layout changed.
+    ``process()`` runs Docling's multi-pass / table overlay there; the streaming
+    per-page extractor is pymupdf4llm-only and can't reproduce that, so we keep
+    such docs on ``process()`` (and forgo per-page markers for them). Uses
+    pdfmux's own ``classify().has_tables`` signal. Errs toward ``False`` (allow
+    streaming) when classification isn't available — the common digital case.
+    """
+    try:
+        from pdfmux.detect import classify
+    except Exception:
+        return False
+    try:
+        return bool(getattr(classify(str(src)), "has_tables", False))
+    except Exception:
+        return False
+
+
+def _extract_pages_via_streaming(
+    src: Path, quality: str
+) -> Optional[Tuple[List[Tuple[int, str]], Optional[float], Optional[float]]]:
+    """Per-page text via ``pdfmux.streaming.process_streaming`` (1.7.0+).
+
+    Returns ``(pages, doc_confidence, min_page_confidence)`` with one
+    ``(page_index, text)`` per page in document order — gaps filled with empty
+    text so page markers stay continuous and figure interleave stays aligned to
+    PyMuPDF's 0-based page indices. Returns ``None`` if the streaming API isn't
+    importable or yields no pages, so the caller can fall back to ``process()``.
+
+    The fast pass reads each page through the same ``pymupdf4llm.to_markdown``
+    that ``process()``'s digital path uses (so doc2md's OCR policy still applies
+    via :func:`_patch_pymupdf4llm_ocr`); bad/empty pages are re-extracted with
+    OCR exactly as the multi-pass pipeline does, except in ``fast`` quality.
+    """
+    try:
+        from pdfmux.streaming import process_streaming
+    except Exception:
+        return None
+    page_map: Dict[int, Tuple[str, Optional[float]]] = {}
+    doc_conf: Optional[float] = None
+    page_count: Optional[int] = None
+    try:
+        for ev in process_streaming(str(src), quality=quality):
+            if ev.type == "classified":
+                page_count = ev.data.get("page_count")
+            elif ev.type == "page":
+                d = ev.data
+                page_map[int(d["page_num"])] = (d.get("text") or "", d.get("confidence"))
+            elif ev.type == "complete":
+                doc_conf = ev.data.get("total_confidence")
+    except Exception:
+        return None
+    if not page_map:
+        return None
+    n = page_count if page_count else max(page_map) + 1
+    pages: List[Tuple[int, str]] = []
+    confs: List[float] = []
+    for i in range(n):
+        text, conf = page_map.get(i, ("", None))
+        pages.append((i, text))
+        if conf is not None:
+            confs.append(conf)
+    min_conf = min(confs) if confs else doc_conf
+    return pages, doc_conf, min_conf
+
+
+def _extract_pages_via_process(
+    src: Path, quality: str
+) -> Tuple[List[Tuple[int, str]], Optional[float], Optional[float]]:
+    """Single combined-blob extraction via ``pdfmux.pipeline.process`` (legacy).
+
+    The page-marker-free path: ``process()`` returns a ``ConversionResult`` whose
+    ``.text`` is one blob (no per-page split as of pdfmux 1.7.0), so markers stay
+    dormant. Used for the Docling-table / LLM routes and whenever streaming is
+    unavailable. The ``getattr(result, "pages", ...)`` branch is kept dormant so
+    real per-page text auto-activates if ``process()`` ever populates ``.pages``.
+    Falls back to public ``extract_text`` only if the internal layout changed.
     """
     try:
         from pdfmux.pipeline import process
@@ -1413,6 +1488,82 @@ def _extract_pdf_pages(src: Path, quality: str) -> Tuple[List[Tuple[int, str]], 
     import pdfmux
 
     return [(0, pdfmux.extract_text(str(src), quality=quality))], None, None
+
+
+def _extract_pdf_pages(
+    src: Path, quality: str
+) -> Tuple[List[Tuple[int, str]], Optional[float], Optional[float], str]:
+    """Run pdfmux → ``(pages, doc_confidence, min_page_confidence, source)``.
+
+    ``pages`` is a list of ``(page_index, text)``. ``source`` records which path
+    produced it (consumed by :func:`_page_marker_decision` for provenance):
+
+    * ``"streaming"`` — real per-page text from ``process_streaming``; page
+      markers + inline figure interleave activate.
+    * ``"process-tables"`` / ``"process-llm"`` / ``"process-fallback"`` — a
+      single combined blob from ``process()`` (markers dormant), used when the
+      doc routes to Docling tables (``--quality standard`` + detected tables),
+      the LLM path (``--quality high``), or streaming is unavailable.
+
+    The Docling/LLM routes stay on ``process()`` because its multi-pass /
+    table-overlay output is higher fidelity than streaming's pymupdf4llm-only
+    per-page text there. ``--quality fast`` forces the per-page path everywhere
+    (``process()`` itself skips Docling re-extraction in fast mode, so there's no
+    fidelity to lose). ``quality`` is already resolved (never ``"auto"``) here.
+    """
+    if quality == "high":
+        return (*_extract_pages_via_process(src, quality), "process-llm")
+    if quality == "standard" and _pdf_routes_to_docling(src):
+        return (*_extract_pages_via_process(src, quality), "process-tables")
+    streamed = _extract_pages_via_streaming(src, quality)
+    if streamed is not None:
+        return (*streamed, "streaming")
+    return (*_extract_pages_via_process(src, quality), "process-fallback")
+
+
+_PAGE_MARKER_OVERRIDE = "--no-rag-metadata (drops all RAG provenance)"
+
+
+def _page_marker_decision(source: str) -> Optional[Dict[str, str]]:
+    """Reportable record (à la :func:`_ocr_decision`) for whether RAG page
+    markers were woven, keyed by the :func:`_extract_pdf_pages` ``source``.
+
+    ``None`` when there's nothing notable to record. Callers announce the
+    ``"off"`` (suppressed) cases and keep the ``"on"`` default silent.
+    """
+    if source in ("streaming", "process-pages"):
+        return {
+            "setting": "page-markers",
+            "choice": "on",
+            "reason": "per-page text available — page-boundary markers woven in",
+            "override": _PAGE_MARKER_OVERRIDE,
+        }
+    suppressed = {
+        "process-tables": (
+            "table doc at --quality standard — kept on process() for Docling "
+            "table fidelity (single blob, no per-page markers)",
+            "--quality fast (forces per-page markers via pymupdf4llm)",
+        ),
+        "process-llm": (
+            "--quality high LLM path — extracted via process() "
+            "(single blob, no per-page markers)",
+            _PAGE_MARKER_OVERRIDE,
+        ),
+        "process-fallback": (
+            "pdfmux streaming unavailable — fell back to process() "
+            "(single blob, no per-page markers)",
+            _PAGE_MARKER_OVERRIDE,
+        ),
+    }
+    if source in suppressed:
+        reason, override = suppressed[source]
+        return {
+            "setting": "page-markers",
+            "choice": "off",
+            "reason": reason,
+            "override": override,
+        }
+    return None
 
 
 def convert_pdf(
@@ -1444,10 +1595,11 @@ def convert_pdf(
             tmpdir = tempfile.TemporaryDirectory(prefix="doc2md_preview_")
             work_src = _slice_pdf_pages(src, preview_pages, Path(tmpdir.name))
 
-        pages_text, confidence, min_conf = _extract_pdf_pages(work_src, quality)
+        pages_text, confidence, min_conf, page_source = _extract_pdf_pages(work_src, quality)
         markdown, visuals = build_markdown_with_visuals(
             pages_text, work_src, dest, cfg, doc_title=src.stem, mark_pages=page_markers
         )
+        markers_applied = page_markers and len(pages_text) > 1
     finally:
         if tmpdir is not None:
             tmpdir.cleanup()
@@ -1463,6 +1615,8 @@ def convert_pdf(
         min_page_confidence=min_conf,
         visuals=visuals,
         cleaning=cleaning,
+        page_source=page_source,
+        page_markers_applied=markers_applied,
     )
 
 
@@ -3397,6 +3551,15 @@ def process_file(
             record.figures = _figure_counts(conv.visuals)
             record.cleaning = conv.cleaning
             _report_cleaning(record)
+            # Record whether RAG page markers were woven (only meaningful for a
+            # multi-page doc with provenance on). Announce only the suppressed
+            # cases; the per-page default is unremarkable and stays silent.
+            if rag_metadata and fm_page_count > 1:
+                pm_decision = _page_marker_decision(conv.page_source)
+                if pm_decision is not None:
+                    _note_auto_decision(
+                        record, pm_decision, announce=pm_decision["choice"] == "off"
+                    )
             if deps.get("pdftotext"):
                 original_plaintext = extract_pdf_plaintext(src, last_page=preview_pages)
         elif fmt in ("mhtml", "html", "docx"):
