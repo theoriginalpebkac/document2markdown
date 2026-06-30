@@ -91,7 +91,7 @@ except ImportError:  # pragma: no cover - exercised only where PyMuPDF is absent
 # Configuration / defaults
 # --------------------------------------------------------------------------- #
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 
 # Resolved once and cached. ``None`` when git or the repo is unavailable.
 _GIT_COMMIT_UNSET = object()
@@ -270,6 +270,10 @@ class PdfConversion:
     cleaning: Dict[str, object] = field(default_factory=dict)
     page_source: str = "process-fallback"  # see :func:`_extract_pdf_pages`
     page_markers_applied: bool = False  # were page-boundary markers woven in
+    # PyMuPDF table objects find_tables() returned but whose ``bbox`` couldn't be
+    # computed (degenerate, empty cell list). Skipped, not imaged — surfaced so a
+    # silent drop is auditable rather than invisible.
+    degenerate_tables: int = 0
 
 
 @dataclass
@@ -304,6 +308,11 @@ class FileRecord:
     # Markdown-cleanup stats (lines/tables removed, splits repaired); empty when
     # cleaning is disabled (--no-clean) or the format isn't PDF.
     cleaning: Dict[str, object] = field(default_factory=dict)
+    # Non-fatal extraction anomalies worth auditing, keyed by kind -> count (e.g.
+    # ``degenerate_tables``: PyMuPDF tables skipped because their bbox couldn't be
+    # computed). Empty when nothing odd happened. Kept out of ``figures`` so it
+    # never skews the figures-extracted total.
+    extraction_warnings: Dict[str, int] = field(default_factory=dict)
     error: Optional[str] = None
 
 
@@ -949,6 +958,7 @@ def extract_page_visuals(
     slug: str,
     doc_title: str,
     cfg: VisualConfig,
+    stats: Optional[Dict[str, int]] = None,
 ) -> List[Visual]:
     """Render diagrams, info images, and complex tables on one page to PNG.
 
@@ -956,6 +966,9 @@ def extract_page_visuals(
     against any PDF independently of the conversion pipeline. ``slug`` prefixes
     every filename so PNGs stay unique/traceable even if relocated, and
     ``doc_title`` is woven into alt text for decontextualized RAG chunks.
+
+    When ``stats`` is given, non-fatal extraction anomalies are accumulated into
+    it (currently ``degenerate_tables``) so callers can surface them.
     """
     visuals: List[Visual] = []
     page_rect = page.rect
@@ -983,7 +996,20 @@ def extract_page_visuals(
             table_objs = list(page.find_tables().tables)
         except Exception:
             table_objs = []
-    table_rects = [(_rect(t.bbox) & page_rect) for t in table_objs]
+    # PyMuPDF's ``Table.bbox`` raises ValueError("min() iterable argument is
+    # empty") on degenerate tables whose cell list is empty, so compute each
+    # rect defensively and drop any table that can't yield one — keeping
+    # table_objs and table_rects aligned for the zip() below.
+    paired = []
+    for t in table_objs:
+        try:
+            paired.append((t, _rect(t.bbox) & page_rect))
+        except Exception:
+            if stats is not None:
+                stats["degenerate_tables"] = stats.get("degenerate_tables", 0) + 1
+            continue
+    table_objs = [t for t, _ in paired]
+    table_rects = [r for _, r in paired]
 
     t_idx = 0
     for tab, trect in zip(table_objs, table_rects) if cfg.extract_tables else []:
@@ -1044,6 +1070,7 @@ def build_markdown_with_visuals(
     cfg: VisualConfig,
     doc_title: str,
     mark_pages: bool = False,
+    stats: Optional[Dict[str, int]] = None,
 ) -> Tuple[str, List[Visual]]:
     """Combine pdfmux text with extracted visual blocks, keeping figures near
     their page's context.
@@ -1082,7 +1109,8 @@ def build_markdown_with_visuals(
         if doc is not None:
             for page_index in range(doc.page_count):
                 vis = extract_page_visuals(
-                    doc[page_index], page_index, fig_dir, rel_base, slug, doc_title, cfg
+                    doc[page_index], page_index, fig_dir, rel_base, slug, doc_title, cfg,
+                    stats=stats,
                 )
                 if vis:
                     visual_md_by_page[page_index] = render_visual_markdown(vis)
@@ -1660,8 +1688,10 @@ def convert_pdf(
             work_src = _slice_pdf_pages(src, preview_pages, Path(tmpdir.name))
 
         pages_text, confidence, min_conf, page_source = _extract_pdf_pages(work_src, quality)
+        visual_stats: Dict[str, int] = {}
         markdown, visuals = build_markdown_with_visuals(
-            pages_text, work_src, dest, cfg, doc_title=src.stem, mark_pages=page_markers
+            pages_text, work_src, dest, cfg, doc_title=src.stem, mark_pages=page_markers,
+            stats=visual_stats,
         )
         markers_applied = page_markers and len(pages_text) > 1
     finally:
@@ -1681,6 +1711,7 @@ def convert_pdf(
         cleaning=cleaning,
         page_source=page_source,
         page_markers_applied=markers_applied,
+        degenerate_tables=visual_stats.get("degenerate_tables", 0),
     )
 
 
@@ -3613,6 +3644,14 @@ def process_file(
             record.pdfmux_confidence = conv.confidence
             record.min_page_confidence = conv.min_page_confidence
             record.figures = _figure_counts(conv.visuals)
+            if conv.degenerate_tables:
+                record.extraction_warnings["degenerate_tables"] = conv.degenerate_tables
+                print(
+                    "[warn] %s: skipped %d degenerate table(s) PyMuPDF could not "
+                    "bound (empty cells) — not imaged"
+                    % (record.filename, conv.degenerate_tables),
+                    file=sys.stderr,
+                )
             record.cleaning = conv.cleaning
             _report_cleaning(record)
             # Record whether RAG page markers were woven (only meaningful for a
