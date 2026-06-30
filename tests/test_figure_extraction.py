@@ -87,3 +87,44 @@ def test_per_page_text_interleaves_visuals_inline(tmp_path):
     # The figure block follows the second page's text, and page markers are woven in.
     assert body.index("Second page text.") < body.index("p.2")
     assert "<!-- doc2md:page=2 -->" in body
+
+
+class _BboxRaisingTable:
+    """Stand-in for a PyMuPDF ``Table`` whose ``bbox`` blows up.
+
+    PyMuPDF's real ``Table.bbox`` raises ``ValueError("min() iterable argument
+    is empty")`` on a degenerate detection with an empty cell list. We must skip
+    it, not let it abort the whole document (the original crash).
+    """
+
+    @property
+    def bbox(self):
+        raise ValueError("min() iterable argument is empty")
+
+
+class _FakeFindTables:
+    def __init__(self, tables):
+        self.tables = tables
+
+
+def test_degenerate_table_is_skipped_and_counted(tmp_path, monkeypatch):
+    pdf = tmp_path / "degen.pdf"
+    _pdf_with_images_on_pages(pdf, image_pages=set(), n_pages=1)  # prose only
+    doc = pymupdf.open(str(pdf))
+    try:
+        page = doc[0]
+        # One table PyMuPDF "detected" but can't bound — exactly the crash case.
+        monkeypatch.setattr(
+            page, "find_tables", lambda *a, **k: _FakeFindTables([_BboxRaisingTable()])
+        )
+        stats: dict = {}
+        cfg = doc2md.VisualConfig()  # tables on by default
+        # Must not raise (was: ValueError aborting the conversion).
+        visuals = doc2md.extract_page_visuals(
+            page, 0, tmp_path / "figs", "figs/figures", "degen", "Degen", cfg, stats=stats
+        )
+    finally:
+        doc.close()
+
+    assert visuals == []  # degenerate table yields no image
+    assert stats["degenerate_tables"] == 1  # but it is counted, not silently lost
