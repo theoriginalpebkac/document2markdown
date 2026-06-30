@@ -138,7 +138,7 @@ before the similarity check, so they never affect validation).
   page_count: 142
   confidence: 0.9123
   converted: "2024-03-02"
-  doc2md_version: "0.2.0"
+  doc2md_version: "0.3.0"
   ---
   ```
 
@@ -158,10 +158,15 @@ before the similarity check, so they never affect validation).
 
 - **Page-boundary markers** — `<!-- doc2md:page=N -->` HTML comments at each PDF
   page boundary, so a chunk's source page survives even after page numbers are
-  stripped from the prose. Emitted only where the extractor exposes per-page
-  text; current pdfmux returns a single combined text blob, so these are
-  presently suppressed (rather than emitting a misleading lone `page=1`) and
-  appear automatically once per-page text is available.
+  stripped from the prose. Emitted wherever real per-page text is available,
+  which doc2md obtains from pdfmux's per-page streaming extractor. They are
+  suppressed (rather than emitting a misleading lone `page=1`) only on the
+  single-blob paths: documents that route to Docling's table extractor at
+  `--quality standard`, and the `--quality high` LLM path — both kept on
+  pdfmux's higher-fidelity multi-pass output. `--quality fast` forces per-page
+  markers everywhere. When markers are suppressed for a multi-page document it
+  is reported as a `[auto] page-markers = off` decision (and in
+  `conversion_report.json`).
 
 ### Figure & table extraction
 
@@ -176,14 +181,14 @@ representation** — while avoiding image bloat:
 | Text, headings, lists, code | Markdown only |
 | **Vector diagrams** (drawn as native shapes) | **opt-in** via `--vector-diagrams` *(see caveat)* |
 
-Figures are placed next to the text of the page they came from **when the
-extractor exposes per-page text**. When it returns a single combined text blob
-for the document (as current pdfmux does), there is no per-page anchor to
-interleave into, so the figures are instead appended **grouped by page** under a
-`## Figures & tables (by page)` heading at the end of the file. Provenance is
-unaffected either way — every block carries its `[Figure — p.N]` label and
-page-stamped alt text — and the placement returns to inline automatically once
-the extractor provides per-page text.
+Figures are placed next to the text of the page they came from **when per-page
+text is available** (the streaming extractor path). On the single-blob paths
+(Docling tables at `--quality standard`, or `--quality high`) there is no
+per-page anchor to interleave into, so the figures are instead appended
+**grouped by page** under a `## Figures & tables (by page)` heading at the end of
+the file. Provenance is unaffected either way — every block carries its
+`[Figure — p.N]` label and page-stamped alt text — and placement returns to
+inline automatically wherever per-page text is available.
 
 Complex-table blocks put the image reference **immediately before** the
 best-effort Markdown table, with no heading between them, so a structural or
