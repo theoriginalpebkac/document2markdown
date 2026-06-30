@@ -91,7 +91,50 @@ except ImportError:  # pragma: no cover - exercised only where PyMuPDF is absent
 # Configuration / defaults
 # --------------------------------------------------------------------------- #
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
+
+# Resolved once and cached. ``None`` when git or the repo is unavailable.
+_GIT_COMMIT_UNSET = object()
+_git_commit_cache: object = _GIT_COMMIT_UNSET
+
+
+def git_commit() -> Optional[str]:
+    """Short commit hash of the doc2md.py checkout (``-dirty`` when the working
+    tree has uncommitted changes), or ``None`` if git/the repo is unavailable.
+
+    Stamped into every output's provenance alongside ``__version__``. The SHA is
+    the *precise* regeneration key — it pins the exact code with no manual
+    discipline, where SemVer depends on remembering to bump it. Detected once and
+    cached; any failure (no git on PATH, not a checkout, the single file copied
+    out of the repo) degrades silently to ``None`` so provenance is best-effort
+    and never blocks a conversion.
+    """
+    global _git_commit_cache
+    if _git_commit_cache is not _GIT_COMMIT_UNSET:
+        return _git_commit_cache  # type: ignore[return-value]
+    _git_commit_cache = None
+    repo = str(Path(__file__).resolve().parent)
+    try:
+        rev = subprocess.run(
+            ["git", "-C", repo, "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if rev.returncode != 0:
+            return None
+        sha = rev.stdout.strip()
+        if not sha:
+            return None
+        dirty = subprocess.run(
+            ["git", "-C", repo, "status", "--porcelain"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if dirty.returncode == 0 and dirty.stdout.strip():
+            sha += "-dirty"
+        _git_commit_cache = sha
+    except (OSError, subprocess.SubprocessError):
+        _git_commit_cache = None
+    return _git_commit_cache  # type: ignore[return-value]
+
 
 DEFAULT_WORKERS = 4
 DEFAULT_SIMILARITY_THRESHOLD = 0.90
@@ -640,8 +683,29 @@ def build_frontmatter(
         lines.append("confidence: %s" % round(confidence, 4))
     lines.append("converted: " + safe_yaml_string(converted))
     lines.append("doc2md_version: " + safe_yaml_string(__version__))
+    commit = git_commit()
+    if commit:
+        lines.append("doc2md_commit: " + safe_yaml_string(commit))
     lines.append("---")
     return "\n".join(lines)
+
+
+def yaml_provenance_header() -> str:
+    """Comment-line provenance stamp prepended to ``.yaml`` outputs.
+
+    YAML outputs (XML→config conversions) can't carry a ``---`` frontmatter block
+    — its top-level ``---`` would open a second YAML document — so the same
+    version/commit provenance rides as leading ``#`` comments instead. Comments
+    are ignored on parse, so this is invisible to downstream loaders and to
+    :func:`yaml_fidelity_check`. Trailing newline included so the body follows
+    cleanly. Mirrors the ``doc2md_version``/``doc2md_commit`` keys in
+    :func:`build_frontmatter`.
+    """
+    lines = ["# doc2md_version: %s" % __version__]
+    commit = git_commit()
+    if commit:
+        lines.append("# doc2md_commit: %s" % commit)
+    return "\n".join(lines) + "\n"
 
 
 # --------------------------------------------------------------------------- #
@@ -3646,12 +3710,13 @@ def process_file(
             record.cleaning = cleaning
             _report_cleaning(record)
 
-        # Prepend YAML provenance frontmatter to Markdown outputs (not .yaml,
-        # whose top-level "---" would start a second YAML document). Done here,
-        # centrally, so every Markdown-producing format gets it identically; the
-        # block is part of the validated string (== on disk) and is stripped
-        # before the fidelity comparison. CSV returns earlier and injects its own
-        # frontmatter per split part (see the csv branch above).
+        # Prepend provenance metadata centrally so every format gets it
+        # identically. Markdown gets a "---" YAML frontmatter block; .yaml gets
+        # the same version/commit as leading "#" comments instead (its own
+        # top-level "---" would start a second YAML document). The stamp is part
+        # of the validated string (== on disk) and, for Markdown, is stripped
+        # before the fidelity comparison; YAML comments are ignored on parse. CSV
+        # returns earlier and injects its own frontmatter per split part.
         if rag_metadata and output_format == "markdown":
             try:
                 frontmatter = build_frontmatter(
@@ -3670,6 +3735,15 @@ def process_file(
             except Exception as exc:  # frontmatter must never break a conversion
                 print(
                     "[meta] %s: skipped frontmatter — %s" % (src.name, exc),
+                    file=sys.stderr,
+                )
+        elif rag_metadata and output_format == "yaml":
+            try:
+                markdown = yaml_provenance_header() + markdown
+                Path(dest).write_text(markdown, encoding="utf-8")
+            except Exception as exc:  # provenance must never break a conversion
+                print(
+                    "[meta] %s: skipped yaml provenance — %s" % (src.name, exc),
                     file=sys.stderr,
                 )
 
