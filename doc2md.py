@@ -95,7 +95,7 @@ except ImportError:  # pragma: no cover - exercised only where PyMuPDF is absent
 # Configuration / defaults
 # --------------------------------------------------------------------------- #
 
-__version__ = "0.8.0"
+__version__ = "0.9.0"
 
 # Resolved once and cached. ``None`` when git or the repo is unavailable.
 _GIT_COMMIT_UNSET = object()
@@ -2667,6 +2667,20 @@ def _rag_leaf_value(node: Any) -> str:
     return " ".join(str(node).split())
 
 
+def _rag_text(node: Any) -> Any:
+    """The element's own scalar text, unwrapping ``xmltodict``'s mixed-content
+    node. An element that has text *and* children (here always a positioned
+    ``_comment``, e.g. ``<value><_comment>2^19</_comment>524288</value>``) parses
+    to ``{'#text': '524288', '_comment': '2^19'}``; the bare value is its
+    ``#text``. Returns ``node`` unchanged when it isn't such a mapping, so callers
+    can blindly pass any leaf/value through. Prevents the raw Python ``dict``
+    repr from leaking into a value position (the summary's variable values and any
+    discriminator value)."""
+    if isinstance(node, dict) and "#text" in node:
+        return node["#text"]
+    return node
+
+
 def _rag_flatten(node: Any, path: List[str], out: List[str]) -> None:
     """Append one ``a > b > c = value`` line per leaf scalar under ``node``.
 
@@ -2683,9 +2697,14 @@ def _rag_flatten(node: Any, path: List[str], out: List[str]) -> None:
         else:
             here = path
         before = len(out)
+        if "#text" in node and here:
+            # Mixed content: the element has its own text *plus* children (always a
+            # positioned ``_comment`` here). The text is this element's value — emit
+            # it on the element's own segment, not as a spurious ``> #text`` child.
+            out.append("%s = %s" % (_RAG_SEP.join(here), _rag_leaf_value(node["#text"])))
         for k, v in node.items():
-            if k == dkey:
-                continue  # folded into the segment; re-emitting under a sibling is noise
+            if k == dkey or k == "#text":
+                continue  # discriminator folds into the segment; #text handled above
             _rag_flatten(v, here + [k], out)
         if dkey is not None and len(out) == before:
             # The discriminator was this node's ONLY content (e.g. a bare
@@ -2724,15 +2743,15 @@ def _rag_manifest(parsed: Any) -> str:
                 if k.startswith("forward:origin-server") or k == "forward:modify-host-header":
                     for item in (v if isinstance(v, list) else [v]):
                         if isinstance(item, dict):
-                            emit_origin(item.get("host"))
-                            emit_origin(item.get("value"))
+                            emit_origin(_rag_text(item.get("host")))
+                            emit_origin(_rag_text(item.get("value")))
                             dns = item.get("dns-name")
                             if isinstance(dns, dict):
-                                emit_origin(dns.get("value"))
+                                emit_origin(_rag_text(dns.get("value")))
                 if k == "assign:variable":
                     for item in (v if isinstance(v, list) else [v]):
                         if isinstance(item, dict) and isinstance(item.get("name"), str):
-                            variables.append((item["name"], item.get("value")))
+                            variables.append((item["name"], _rag_text(item.get("value"))))
                 rec(v)
         elif isinstance(node, list):
             for item in node:

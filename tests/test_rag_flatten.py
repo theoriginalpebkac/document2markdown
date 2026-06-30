@@ -116,6 +116,35 @@ def test_sole_discriminator_node_still_emits_value(leaf_lines):
     assert any("schema revision 3" in ln.split(" = ", 1)[1] for ln in leaf_lines)
 
 
+def test_mixed_content_text_folds_no_dict_or_hash_text():
+    """A comment positioned next to an element's text makes ``xmltodict`` parse it
+    as a mixed-content ``{'#text': value, '_comment': note}`` node. The value must
+    surface on the element's own segment (not a spurious ``> #text`` child), and
+    the raw Python ``dict`` repr must never leak — neither in the flattened leaves
+    nor in the summary's variable values (the bugs a chunk-based reviewer hit)."""
+    xml = (
+        '<?xml version="1.0"?>\n'
+        "<configs>\n"
+        "  <assign:variable>\n"
+        "    <name>FLAG_CW</name>\n"
+        "    <!-- 2^19 -->\n"
+        "    <value>524288</value>\n"
+        "  </assign:variable>\n"
+        "</configs>\n"
+    )
+    out = doc2md.xml_to_rag(xml)
+    assert "#text" not in out, "mixed-content text leaked as a '> #text' segment"
+    assert "{'" not in out and "': '" not in out, "raw dict repr leaked into output"
+    # the value rides on the element's own segment...
+    assert "> value = 524288" in out
+    # ...the variable summary shows the bare value, not a dict...
+    assert "Variable FLAG_CW is set to: 524288" in out
+    # ...and the annotating comment is still present (value-recall fidelity).
+    assert "> value > _comment = 2^19" in out
+    ok, reason = doc2md.rag_fidelity_check(out, xml)
+    assert ok is True, reason
+
+
 def test_summary_block_present(rag_output):
     """The deterministic summary block is emitted. Its origin/variable extraction
     is vocabulary-specific, so with neutral input both sections report none —
