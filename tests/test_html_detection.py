@@ -166,3 +166,61 @@ def test_convert_word_html_end_to_end(tmp_path):
     # The inline figure is rewritten to a real file reference, not a data: blob.
     assert "data:image" not in wc.markdown
     assert (tmp_path / "out" / "issue" / "figures" / "issue-figure01.png").exists()
+
+
+# --------------------------------------------------------------------------- #
+# _unwrap_html_comments — commented-out documentation content is not discarded
+# --------------------------------------------------------------------------- #
+#
+# Some Confluence/legacy exports carry real prose inside <!-- --> (e.g. a
+# collapsed section flattened to a comment on export, or an old show/hide-via-
+# script pattern that never fires in a static export). Pandoc never renders
+# comments, so doc2md must unwrap them before conversion or that content is
+# silently dropped from the Markdown.
+
+
+def test_unwrap_html_comments_exposes_content():
+    html = "<p>a</p><!-- <h2>hidden</h2><p>b</p> --><p>c</p>"
+    out = doc2md._unwrap_html_comments(html)
+    assert "<!--" not in out and "-->" not in out
+    assert "<h2>hidden</h2>" in out
+
+
+def test_unwrap_html_comments_stops_at_first_terminator():
+    html = "<!-- one --><!-- two -->"
+    out = doc2md._unwrap_html_comments(html)
+    assert out == " one  two "
+
+
+@pandoc
+def test_convert_word_html_surfaces_commented_body_content(tmp_path):
+    src = tmp_path / "issue.doc"
+    src.write_text(
+        "<!DOCTYPE html>\n<html><head><title>Issue</title></head><body>"
+        "<h1>Visible heading</h1>"
+        "<!-- <p>Appendix content that was commented out on export.</p> -->"
+        "</body></html>"
+    )
+    dest = tmp_path / "out" / "issue.md"
+    wc = doc2md.convert_word(src, dest, "html", have_pandoc=True)
+    assert "Visible heading" in wc.markdown
+    assert "Appendix content that was commented out on export" in wc.markdown
+    # The reference text used for the fidelity check must agree, or a faithful
+    # conversion would still fail validation against its own reference.
+    assert "Appendix content" in wc.ref_plaintext
+
+
+@pandoc
+def test_convert_word_html_head_comment_stays_out_of_body(tmp_path):
+    # MSO conditional-comment settings blocks live in <head> and carry no real
+    # content; unwrapping them must not leak metadata noise into the body.
+    src = tmp_path / "issue.doc"
+    src.write_text(
+        "<html><head><title>Issue</title>"
+        "<!--[if gte mso 9]><xml><o:Zoom>90</o:Zoom></xml><![endif]-->"
+        "</head><body><p>Real body text.</p></body></html>"
+    )
+    dest = tmp_path / "out" / "issue.md"
+    wc = doc2md.convert_word(src, dest, "html", have_pandoc=True)
+    assert "Real body text" in wc.markdown
+    assert "90" not in wc.markdown

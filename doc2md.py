@@ -95,7 +95,7 @@ except ImportError:  # pragma: no cover - exercised only where PyMuPDF is absent
 # Configuration / defaults
 # --------------------------------------------------------------------------- #
 
-__version__ = "0.9.0"
+__version__ = "0.10.0"
 
 # Resolved once and cached. ``None`` when git or the repo is unavailable.
 _GIT_COMMIT_UNSET = object()
@@ -2042,6 +2042,21 @@ def _strip_noncontent_regions(html: str) -> str:
     return _NONCONTENT_REGION_RE.sub(" ", html)
 
 
+# Documentation exports (Confluence/Word MHTML) sometimes carry real prose
+# inside <!-- --> — e.g. a collapsed/hidden section flattened to a comment on
+# export. Browsers (and pandoc) never render comments, so leaving them wrapped
+# silently drops that content from the Markdown. doc2md converts documentation,
+# not live web pages, so comment content is always unwrapped rather than
+# discarded — this must run before both the Markdown conversion and the
+# fidelity reference extraction so the two stay in sync.
+_HTML_COMMENT_RE = re.compile(r"<!--(.*?)-->", re.DOTALL)
+
+
+def _unwrap_html_comments(html: str) -> str:
+    """Expose ``<!-- -->`` comment content as regular markup."""
+    return _HTML_COMMENT_RE.sub(lambda m: m.group(1), html)
+
+
 def _strip_html(html: str) -> str:
     """Crude HTML -> plain text for the fidelity comparison (no deps)."""
     import html as _h
@@ -2125,6 +2140,7 @@ def convert_word(
 
     if fmt == "mhtml":
         html, parts = extract_mhtml(src)
+        html = _unwrap_html_comments(html)
         ref_plaintext = _strip_html(_strip_noncontent_regions(html))
         key_to_meta: Dict[str, Tuple[str, str]] = {}
         n = 0
@@ -2158,6 +2174,7 @@ def convert_word(
         # ``.doc``). Same pipeline as the MHTML branch minus the MIME unwrapping:
         # extract inline ``data:`` figures, convert via pandoc, then de-chrome.
         html = src.read_text(encoding="utf-8", errors="replace")
+        html = _unwrap_html_comments(html)
         ref_plaintext = _strip_html(_strip_noncontent_regions(html))
         n = 0
         if cfg.enabled and cfg.extract_images:
