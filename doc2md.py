@@ -95,7 +95,7 @@ except ImportError:  # pragma: no cover - exercised only where PyMuPDF is absent
 # Configuration / defaults
 # --------------------------------------------------------------------------- #
 
-__version__ = "0.10.0"
+__version__ = "0.11.0"
 
 # Resolved once and cached. ``None`` when git or the repo is unavailable.
 _GIT_COMMIT_UNSET = object()
@@ -2192,16 +2192,42 @@ def convert_word(
         if not have_pandoc:
             raise RuntimeError("pandoc is required to convert .docx; see requirements.txt.")
         args = ["pandoc", "-f", "docx", "-t", "gfm", "--wrap=none"]
-        media_root = dest.parent / slug
+        media_tmp = Path(tempfile.mkdtemp(prefix="doc2md-docx-media-"))
         if cfg.enabled and cfg.extract_images:
-            args += ["--extract-media", str(media_root)]
+            args += ["--extract-media", str(media_tmp)]
         args.append(str(src))
         proc = subprocess.run(args, capture_output=True, text=True)
         if proc.returncode != 0:
+            shutil.rmtree(media_tmp, ignore_errors=True)
             raise RuntimeError("pandoc docx->md failed: %s" % proc.stderr.strip())
         markdown = proc.stdout
-        media_dir = media_root / "media"
-        n = len(list(media_dir.glob("*"))) if media_dir.is_dir() else 0
+        media_dir = media_tmp / "media"
+        n = 0
+        if media_dir.is_dir():
+            files = sorted(
+                media_dir.glob("image*"),
+                key=lambda p: int(re.search(r"\d+", p.stem).group()),
+            )
+            renames: Dict[str, str] = {}
+            if files:
+                fig_dir.mkdir(parents=True, exist_ok=True)
+            for idx, f in enumerate(files, start=1):
+                new_name = "%s-figure%02d%s" % (slug, idx, f.suffix.lower())
+                f.replace(fig_dir / new_name)
+                renames[f.name] = ("%s/%s" % (rel_base, new_name), idx)
+            n = len(renames)
+
+            def _replace_img(m: "re.Match") -> str:
+                href = m.group(1)
+                meta = renames.get(Path(href).name)
+                if meta is None:
+                    return m.group(0)
+                new_relpath, idx = meta
+                alt = "%s — figure %d" % (src.stem, idx)
+                return "![%s](%s)" % (alt, new_relpath)
+
+            markdown = re.sub(r'<img\s+src="([^"]+)"[^>]*/?>', _replace_img, markdown)
+        shutil.rmtree(media_tmp, ignore_errors=True)
         ref = subprocess.run(
             ["pandoc", "-f", "docx", "-t", "plain", "--wrap=none", str(src)],
             capture_output=True,
