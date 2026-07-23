@@ -95,7 +95,7 @@ except ImportError:  # pragma: no cover - exercised only where PyMuPDF is absent
 # Configuration / defaults
 # --------------------------------------------------------------------------- #
 
-__version__ = "0.11.0"
+__version__ = "0.12.0"
 
 # Resolved once and cached. ``None`` when git or the repo is unavailable.
 _GIT_COMMIT_UNSET = object()
@@ -2057,6 +2057,184 @@ def _unwrap_html_comments(html: str) -> str:
     return _HTML_COMMENT_RE.sub(lambda m: m.group(1), html)
 
 
+# Presentation attributes that carry no Markdown meaning. Stripping them before
+# pandoc keeps them out of the raw-HTML passthrough and lets pandoc emit clean
+# pipe tables / links instead of attribute-laden raw HTML. ``class`` is stripped
+# too, EXCEPT on <pre>/<code> where it carries the code language (``code-java``
+# -> a fenced block); ``colspan``/``rowspan``/``href``/``src``/``title``/``alt``
+# are preserved because they change meaning, not just appearance.
+_PRES_ATTRS = frozenset(
+    {
+        "bgcolor", "valign", "align", "width", "height", "nowrap", "border",
+        "cellpadding", "cellspacing", "style", "rel", "target", "id",
+    }
+)
+# A section/field label longer than this is treated as prose, not a heading.
+_LABEL_MAX = 40
+
+
+def simplify_export_html(html: str) -> str:
+    """Flatten Jira/Confluence "Save as Word" layout tables before pandoc.
+
+    These exports (a Jira issue or Confluence page, often misnamed ``.doc``) lay
+    the *entire* document out with HTML tables: issue metadata is a key/value
+    grid, the description and each comment are single-cell wrapper tables, and
+    genuine data tables are nested inside the comment bodies. Pandoc passes every
+    one of those through as raw HTML (colspan / ``bgcolor`` / block-level cell
+    content all force the fallback), so the Markdown ends up more table markup
+    than prose. Jira and Confluence exports are common inputs, so it is worth
+    reshaping the recognizable layout roles into Markdown:
+
+    - **Comment tables** (rows tagged ``comment-header``/``comment-body``) ->
+      a ``**Comment by …**`` line per comment, an ``hr`` between them, and the
+      body converted natively (prose, code, *nested* data tables kept as tables).
+    - **Single-column wrapper tables** (the description area) -> unwrapped to
+      their cell content so the inner blocks convert to real Markdown.
+    - **Section dividers** (a one-row table whose trailing cells are empty, e.g.
+      "Description" / "Comments") -> a level-2 heading.
+    - **Key/value metadata grids** (bold labels paired with values) ->
+      ``**Label:** value`` lines.
+    - Genuine data tables (no bold-label pattern; e.g. nested Confluence tables)
+      are left alone so pandoc renders them as pipe tables.
+
+    Visible text is conserved (only layout markup, decorative icon images, and
+    presentation attributes are dropped), so the fidelity reference still holds.
+    Best-effort: if BeautifulSoup is unavailable or anything goes wrong, the
+    original HTML is returned unchanged and the run falls back to raw pandoc.
+    """
+    try:
+        from bs4 import BeautifulSoup, NavigableString
+    except ImportError:
+        return html
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+
+        def rows(table):
+            return [tr for tr in table.find_all("tr") if tr.find_parent("table") is table]
+
+        def cells(tr, table):
+            return [
+                c for c in tr.find_all(["td", "th"])
+                if c.find_parent("table") is table and c.find_parent("tr") is tr
+            ]
+
+        def inner(cell):
+            # Unwrap a lone wrapping <p> so we never nest block elements inside a
+            # generated <p> (invalid, and pandoc mishandles it).
+            kids = [
+                k for k in cell.children
+                if not (isinstance(k, NavigableString) and not k.strip())
+            ]
+            if len(kids) == 1 and getattr(kids[0], "name", None) == "p":
+                return kids[0].decode_contents()
+            return cell.decode_contents()
+
+        def replace(table, markup):
+            table.replace_with(BeautifulSoup(markup, "html.parser"))
+
+        def is_comment_table(table):
+            return any(
+                (tr.get("id") or "").startswith(("comment-header", "comment-body"))
+                for tr in rows(table)
+            )
+
+        def is_section_divider(rc):
+            if len(rc) != 1 or len(rc[0]) < 2:
+                return False
+            head = rc[0][0].get_text(" ", strip=True)
+            rest = "".join(c.get_text(" ", strip=True) for c in rc[0][1:])
+            return bool(head) and len(head) <= _LABEL_MAX and not rest
+
+        def is_single_column(rc):
+            return bool(rc) and all(len(cs) == 1 for cs in rc)
+
+        def is_keyvalue(rc):
+            saw_pair = False
+            for cs in rc:
+                n = len(cs)
+                if n == 1:
+                    continue  # title/heading row is allowed among the pairs
+                if n == 0 or n % 2:
+                    return False
+                for i in range(0, n, 2):
+                    if cs[i].name == "th" or cs[i + 1].name == "th":
+                        return False
+                    if cs[i].find(["b", "strong"]) is None:
+                        return False
+                saw_pair = True
+            return saw_pair
+
+        top = [t for t in soup.find_all("table") if t.find_parent("table") is None]
+        for table in top:
+            rc = [cs for cs in (cells(tr, table) for tr in rows(table)) if cs]
+            if not rc:
+                continue
+            if is_comment_table(table):
+                parts, first = [], True
+                for tr in rows(table):
+                    cs = cells(tr, table)
+                    if not cs:
+                        continue
+                    if (tr.get("id") or "").startswith("comment-header"):
+                        if not first:
+                            parts.append("<hr/>")
+                        first = False
+                        parts.append(
+                            "<p><strong>%s</strong></p>" % cs[0].get_text(" ", strip=True)
+                        )
+                    else:
+                        parts.append(cs[0].decode_contents())
+                replace(table, "\n\n".join(parts))
+            elif is_section_divider(rc):
+                replace(table, "<h2>%s</h2>" % rc[0][0].get_text(" ", strip=True))
+            elif is_single_column(rc):
+                replace(table, "\n\n".join(cs[0].decode_contents() for cs in rc))
+            elif is_keyvalue(rc):
+                parts = []
+                for cs in rc:
+                    if len(cs) == 1:
+                        parts.append(cs[0].decode_contents())  # e.g. a title <h3>
+                        continue
+                    for i in range(0, len(cs), 2):
+                        label = cs[i].get_text(" ", strip=True).rstrip(":").strip()
+                        value = inner(cs[i + 1]).strip()
+                        if not label and not value:
+                            continue
+                        parts.append("<p><strong>%s:</strong> %s</p>" % (label, value))
+                replace(table, "\n".join(parts))
+            # else: genuine data table -> leave for pandoc to render as a table.
+
+        # Unwrap layout <div>/<span> (Confluence "code panel" wrappers, Jira
+        # field <span>s) here rather than leaving them for the post-pandoc regex
+        # cleaner: the source escapes code as ``&lt;`` so bs4 unwraps reliably,
+        # whereas the downstream tag-strip is fed Markdown whose code blocks hold
+        # literal ``<``/``>`` (awk, XML mentions) and can't verify losslessness.
+        for tag in soup.find_all(["div", "span"]):
+            tag.unwrap()
+        # Drop decorative icon images (attach/status/user gifs Jira sprinkles in).
+        for img in soup.find_all("img"):
+            if "/icons/" in (img.get("src") or ""):
+                img.decompose()
+        # Strip presentation attributes so the remaining tables/links convert to
+        # clean Markdown; keep code-language classes on <pre>/<code>.
+        for tag in soup.find_all(True):
+            for attr in list(tag.attrs):
+                if attr in _PRES_ATTRS or (
+                    attr == "class" and tag.name not in ("pre", "code")
+                ):
+                    del tag[attr]
+        for col in soup.find_all(["colgroup", "col"]):
+            col.decompose()
+        # Standalone <br> between the (now former) layout tables -> stray "\"
+        # lines in the Markdown; drop the ones that sit at document top level.
+        for br in soup.find_all("br"):
+            if br.parent is soup or getattr(br.parent, "name", None) in ("body", "html"):
+                br.decompose()
+        return str(soup)
+    except Exception:  # pragma: no cover - pre-clean must never break a run
+        return html
+
+
 def _strip_html(html: str) -> str:
     """Crude HTML -> plain text for the fidelity comparison (no deps)."""
     import html as _h
@@ -2160,6 +2338,7 @@ def convert_word(
                 key_to_meta[key] = ("%s/%s" % (rel_base, fname), alt)
                 n += 1
         html = _rewrite_img_srcs(html, key_to_meta)
+        html = simplify_export_html(html)
         markdown = html_to_markdown(html, have_pandoc)
         cleaning: Dict[str, object] = {}
         if clean:
@@ -2179,6 +2358,7 @@ def convert_word(
         n = 0
         if cfg.enabled and cfg.extract_images:
             html, n = _extract_data_uri_images(html, fig_dir, slug, rel_base, src.stem)
+        html = simplify_export_html(html)
         markdown = html_to_markdown(html, have_pandoc)
         cleaning = {}
         if clean:
