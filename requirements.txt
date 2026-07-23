@@ -24,6 +24,12 @@ pymupdf>=1.24.0
 xmltodict>=0.13.0
 PyYAML>=6.0
 
+# beautifulsoup4: reshapes Jira/Confluence "Save as Word" layout tables (issue
+# metadata grids, description/comment wrapper tables) into clean Markdown before
+# pandoc. Imported lazily and best-effort -- HTML conversion still works without
+# it (it just falls back to pandoc's raw-HTML table passthrough).
+beautifulsoup4>=4.9
+
 # --------------------------------------------------------------------------- #
 # System tools (NOT pip-installable) that doc2md.py also needs:
 #
