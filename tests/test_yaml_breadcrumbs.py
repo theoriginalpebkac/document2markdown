@@ -29,8 +29,12 @@ xmltodict = pytest.importorskip("xmltodict")
 
 
 def _round_trips(xml: str, index: bool) -> bool:
-    """True when the emitted YAML parses back to ``xmltodict``'s view of ``xml``."""
-    expected = xmltodict.parse(doc2md._xml_comments_to_elements(xml))
+    """True when the emitted YAML parses back to the converter's order-preserving
+    canonical object. This is the oracle :func:`doc2md.yaml_fidelity_check` uses —
+    *not* ``xmltodict.parse``, which discards the order of non-contiguously
+    interleaved siblings and so would spuriously reject a faithful ordered
+    projection of an interleaved config (see ``test_interleaved_order``)."""
+    expected = doc2md._xml_to_yaml_obj(doc2md._xml_comments_to_elements(xml))
     actual = yaml.safe_load(doc2md.xml_to_yaml(xml, index=index))
     return actual == expected
 
