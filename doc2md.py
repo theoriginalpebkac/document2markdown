@@ -95,7 +95,7 @@ except ImportError:  # pragma: no cover - exercised only where PyMuPDF is absent
 # Configuration / defaults
 # --------------------------------------------------------------------------- #
 
-__version__ = "0.12.0"
+__version__ = "0.13.0"
 
 # Resolved once and cached. ``None`` when git or the repo is unavailable.
 _GIT_COMMIT_UNSET = object()
@@ -2774,21 +2774,187 @@ def _yaml_breadcrumbs(text: str, min_depth: int = 2, sep: str = " > ") -> str:
     return "\n".join(out)
 
 
+# --------------------------------------------------------------------------- #
+# Order-preserving XML parse (shared by --yaml and --rag)
+# --------------------------------------------------------------------------- #
+#
+# ``xmltodict`` groups repeated sibling tags into a single list keyed by tag name.
+# That is lossless *only when* every repeat is contiguous: once a *different* tag
+# intervenes and the tag reappears, grouping silently pulls the reappearance back
+# next to its earlier siblings. In this config XML sibling order encodes
+# execution/override order — variable assignments and match blocks evaluate
+# top-to-bottom — so a reordered ``forward:origin-server`` or ``match:*`` is a
+# real correctness loss, not a cosmetic one.
+#
+# We parse into a small ordered intermediate representation (:class:`_IRNode`)
+# that keeps children in document order, then project it per node. The parser
+# mirrors ``xmltodict``'s conventions exactly (attr prefix ``@``, cdata key
+# ``#text``, whitespace-stripped text, empty element -> ``None``, namespace
+# prefixes preserved) so a node whose children are *not* interleaved projects to a
+# structure byte-identical to the old ``xmltodict``-based output; only genuinely
+# interleaved nodes change shape.
+
+
+class _IRNode:
+    """One XML element: ordered attributes, ordered children, own character data.
+
+    ``attrs`` (``[(name, value), ...]``) and ``children`` (``[(tag, _IRNode), ...]``)
+    preserve document order. ``text`` is the element's *own* character data
+    (descendants excluded), whitespace-stripped, or ``None`` when empty — matching
+    ``xmltodict``'s ``strip_whitespace`` default.
+    """
+
+    __slots__ = ("tag", "attrs", "children", "_text_parts")
+
+    def __init__(self, tag: str) -> None:
+        self.tag = tag
+        self.attrs: List[Tuple[str, str]] = []
+        self.children: List[Tuple[str, "_IRNode"]] = []
+        self._text_parts: List[str] = []
+
+    @property
+    def text(self) -> Optional[str]:
+        joined = "".join(self._text_parts).strip()
+        return joined or None
+
+
+def _xml_to_ir(xml: str) -> _IRNode:
+    """Parse ``xml`` into an ordered :class:`_IRNode` tree via ``expat``.
+
+    Uses a namespace-*unaware* parser (no ``namespace_separator``), so element and
+    attribute names keep their literal ``prefix:local`` form and ``xmlns:*``
+    declarations stay ordinary attributes — exactly as ``xmltodict`` sees them.
+    ``ordered_attributes`` preserves attribute document order. Returns the document
+    root node; propagates ``expat.ExpatError`` on malformed XML.
+    """
+    from xml.parsers import expat  # `import xml...` would shadow the `xml` arg
+
+    sentinel = _IRNode("")  # its single child is the real document root
+    stack: List[_IRNode] = [sentinel]
+
+    def start(name: str, attrs: List[str]) -> None:
+        node = _IRNode(name)
+        for i in range(0, len(attrs), 2):  # ordered_attributes -> flat name/value list
+            node.attrs.append((attrs[i], attrs[i + 1]))
+        stack[-1].children.append((name, node))
+        stack.append(node)
+
+    def end(_name: str) -> None:
+        stack.pop()
+
+    def chars(data: str) -> None:
+        stack[-1]._text_parts.append(data)
+
+    parser = expat.ParserCreate()
+    parser.ordered_attributes = True
+    parser.buffer_text = True
+    parser.StartElementHandler = start
+    parser.EndElementHandler = end
+    parser.CharacterDataHandler = chars
+    parser.Parse(xml, True)
+    return sentinel.children[0][1]
+
+
+def _is_interleaved(tags: List[str]) -> bool:
+    """True when a tag reappears in ``tags`` after a *different* tag intervened.
+
+    Contiguous repeats of the same tag do not count (grouping them is lossless);
+    only a non-contiguous reappearance — where the grouped form would reorder the
+    element relative to its siblings — returns True.
+    """
+    seen: set = set()
+    prev: Optional[str] = None
+    for t in tags:
+        if t == prev:
+            continue  # contiguous repeat: run continues
+        if t in seen:
+            return True  # this tag already had an earlier, now-closed run
+        seen.add(t)
+        prev = t
+    return False
+
+
+def _ir_to_yaml(node: _IRNode) -> Any:
+    """Project an :class:`_IRNode` to the YAML object model.
+
+    A childless element becomes its text scalar (or ``None`` when empty); one with
+    only attributes becomes an ``@attr`` mapping (plus ``#text`` if it also has
+    text). With children, the child tag sequence decides the shape:
+
+    * **not interleaved** -> the compact grouped mapping identical to
+      ``xmltodict``'s output: attributes first, then each distinct child tag in
+      first-encounter order (repeats collapse to a list), then ``#text`` last.
+    * **interleaved** -> an ordered sequence of single-key mappings, one per child
+      in document order, so sibling/execution order is preserved. The node's
+      attributes lead as ``{'@k': v}`` items (attributes precede children in XML)
+      and any mixed text trails as a ``{'#text': v}`` item.
+    """
+    attrs, children, text = node.attrs, node.children, node.text
+
+    if not children:
+        if not attrs:
+            return text  # scalar leaf, or None for an empty element
+        d: Dict[str, Any] = {}
+        for k, v in attrs:
+            d["@" + k] = v
+        if text is not None:
+            d["#text"] = text
+        return d
+
+    if _is_interleaved([t for t, _ in children]):
+        seq: List[Any] = [{"@" + k: v} for k, v in attrs]
+        for tag, child in children:
+            seq.append({tag: _ir_to_yaml(child)})
+        if text is not None:
+            seq.append({"#text": text})
+        return seq
+
+    d = {}
+    for k, v in attrs:
+        d["@" + k] = v
+    order: List[str] = []
+    groups: Dict[str, List[Any]] = {}
+    for tag, child in children:
+        if tag not in groups:
+            groups[tag] = []
+            order.append(tag)
+        groups[tag].append(_ir_to_yaml(child))
+    for tag in order:
+        vals = groups[tag]
+        d[tag] = vals[0] if len(vals) == 1 else vals
+    if text is not None:
+        d["#text"] = text
+    return d
+
+
+def _xml_to_yaml_obj(xml: str) -> Dict[str, Any]:
+    """The full-document YAML object: ``{root_tag: <projection>}`` (see
+    :func:`_ir_to_yaml`). Mirrors ``xmltodict.parse``'s top-level shape so the two
+    are directly comparable for non-interleaved input."""
+    root = _xml_to_ir(xml)
+    return {root.tag: _ir_to_yaml(root)}
+
+
 def xml_to_yaml(raw: str, index: bool = False) -> str:
     """Convert XML to YAML (structure-preserving, low-token, no Markdown wrapper).
 
-    Uses ``xmltodict`` to build a dict — attributes become ``@name`` keys, element
-    text ``#text``, and repeated siblings collapse to lists — then dumps YAML with
-    document order preserved. Intended for configuration XML headed for LLM/RAG
-    ingestion (e.g. NotebookLM, which won't parse XML fenced inside Markdown).
+    Parses into an ordered :class:`_IRNode` tree (:func:`_xml_to_ir`) and projects
+    it with :func:`_ir_to_yaml`: attributes become ``@name`` keys, element text
+    ``#text``, and repeated *contiguous* siblings collapse to lists — a form
+    byte-identical to the earlier ``xmltodict`` output. Where a tag reappears
+    non-contiguously (children are *interleaved*), that node instead becomes an
+    ordered sequence of single-key mappings so sibling order — which encodes
+    execution/override order in this config XML — is preserved rather than lost to
+    by-tag grouping. Intended for configuration XML headed for LLM/RAG ingestion
+    (e.g. NotebookLM, which won't parse XML fenced inside Markdown).
 
     XML comments are preserved and *positioned* — important in config XML, where a
     comment often carries the *why* (e.g. a Jira reference) for the block beneath
     it. :func:`_xml_comments_to_elements` rewrites each comment into a ``_comment``
-    child of the block it annotates before parsing, so it stays attached through
-    ``xmltodict``'s by-key grouping. Processing instructions and the DOCTYPE are
-    still dropped. Mixed prose+inline-tag content is awkward, so this is *not* used
-    for documentation-style XML.
+    child of the block it annotates before parsing, so it stays attached to its
+    block. Processing instructions and the DOCTYPE are still dropped. Mixed
+    prose+inline-tag content is awkward, so this is *not* used for
+    documentation-style XML.
 
     When ``index`` is set (``--yaml-index``), each nested block is prefixed with a
     ``# path: ...`` structural-path breadcrumb (see :func:`_yaml_breadcrumbs`) to
@@ -2799,12 +2965,11 @@ def xml_to_yaml(raw: str, index: bool = False) -> str:
     fall back to a lossless Markdown rendering.
     """
     try:
-        import xmltodict
         import yaml
     except ImportError as exc:
         raise RuntimeError(
-            "--yaml needs the 'xmltodict' and 'PyYAML' packages; "
-            "install them with:  pip install -r requirements.txt"
+            "--yaml needs the 'PyYAML' package; "
+            "install it with:  pip install -r requirements.txt"
         ) from exc
 
     # Render multiline strings (large comment blocks, multiline text) as literal
@@ -2821,7 +2986,7 @@ def xml_to_yaml(raw: str, index: bool = False) -> str:
 
     _BlockDumper.add_representer(str, _str_rep)
 
-    parsed = xmltodict.parse(_xml_comments_to_elements(raw))
+    parsed = _xml_to_yaml_obj(_xml_comments_to_elements(raw))
     # width=inf disables PyYAML's default 80-column line wrapping. Long *plain*
     # scalars (e.g. space-separated IP/CIDR lists in config XML) would otherwise
     # wrap into multi-line plain scalars — valid YAML 1.2, but strict/lightweight
@@ -2858,27 +3023,67 @@ def xml_to_yaml(raw: str, index: bool = False) -> str:
 # Fidelity is instead checked at the value level (every source leaf present); see
 # :func:`rag_fidelity_check`.
 
-# Discriminator keys as they appear in the xmltodict-parsed dict (raw/unquoted) —
-# the same set :func:`_yaml_breadcrumbs` matches in dumped YAML (_YAML_DISC_KEYS).
-_RAG_DISC_KEYS = ("@value", "@name", "@result", "@field", "name")
+# Discriminator keys, in priority order, matched by :func:`_ir_discriminator` —
+# the same identities :func:`_yaml_breadcrumbs` matches in dumped YAML
+# (_YAML_DISC_KEYS): the ``@value``/``@name``/``@result``/``@field`` attributes,
+# then a ``name`` child element.
 _RAG_SEP = " > "
+_RAG_FLATTEN_HEADER = "# FLATTENED CONFIGURATION (path-qualified leaves)"
 
 
-def _rag_discriminator(node: Any) -> Tuple[Optional[str], Optional[str]]:
-    """``(key, "key=value")`` discriminator for a mapping node, else ``(None, None)``.
+def _ir_discriminator(node: "_IRNode") -> Tuple[Optional[str], Optional[str]]:
+    """``(kind, "key=value")`` identity for an IR ``node``, else ``(None, None)``.
 
-    Mirrors the discriminator capture in :func:`_yaml_breadcrumbs`: a node is
-    identified by its first present ``@value``/``@name``/``@result``/``@field``/
-    ``name`` scalar so repeated keys (``match:request.type`` …) don't collide
-    along a path. Booleans are skipped (they aren't config identities).
+    Mirrors :func:`_yaml_breadcrumbs`' capture over the ordered IR: a node is
+    identified by its first present ``@value``/``@name``/``@result``/``@field``
+    *attribute* or, as a last resort, a sole scalar ``name`` *child* — so repeated
+    keys (``match:request.protocol`` …) don't collide along a path. ``kind`` is the
+    attribute key (``'@value'`` …) or ``'name'`` for the child, telling the caller
+    which piece to fold out of the emitted leaves.
+
+    The value is whitespace-normalized (:func:`_rag_leaf_value`) so a multi-line
+    value — e.g. a ``@value`` holding an embedded JSON blob — folds into a
+    single-line path segment and every emitted leaf stays one self-contained
+    record.
     """
-    if not isinstance(node, dict):
-        return None, None
-    for k in _RAG_DISC_KEYS:
-        v = node.get(k)
-        if isinstance(v, (str, int, float)) and not isinstance(v, bool) and str(v) != "":
-            return k, "%s=%s" % (k.lstrip("@"), v)
+    for want in ("value", "name", "result", "field"):
+        for ak, av in node.attrs:
+            if ak == want and av != "":
+                return "@" + want, "%s=%s" % (want, _rag_leaf_value(av))
+    name_children = [c for t, c in node.children if t == "name"]
+    if len(name_children) == 1:
+        nc = name_children[0]
+        if not nc.attrs and not nc.children and nc.text:
+            return "name", "name=%s" % _rag_leaf_value(nc.text)
     return None, None
+
+
+def _ir_child_segments(children: List[Tuple[str, "_IRNode"]]) -> List[str]:
+    """Path segment for each child in order: ``tag`` plus its folded
+    ``(discriminator)``, plus a ``[k]`` positional index **only** where that base
+    segment would otherwise collide with a sibling's — repeated no-discriminator
+    blocks (e.g. three ``forward:origin-server``), or the rare repeated-identical-
+    discriminator case. Unique children stay clean. This is what keeps every
+    flattened leaf path unique, so interleaved/merged siblings no longer blur onto
+    one path (:func:`rag_fidelity_check` enforces the uniqueness).
+    """
+    from collections import Counter
+
+    bases: List[str] = []
+    for tag, child in children:
+        _, dsuf = _ir_discriminator(child)
+        bases.append(tag + ("(%s)" % dsuf if dsuf else ""))
+    counts = Counter(bases)
+    seen: Dict[str, int] = {}
+    segs: List[str] = []
+    for b in bases:
+        if counts[b] > 1:
+            k = seen.get(b, 0)
+            seen[b] = k + 1
+            segs.append("%s[%d]" % (b, k))
+        else:
+            segs.append(b)
+    return segs
 
 
 def _rag_leaf_value(node: Any) -> str:
@@ -2904,41 +3109,43 @@ def _rag_text(node: Any) -> Any:
     return node
 
 
-def _rag_flatten(node: Any, path: List[str], out: List[str]) -> None:
-    """Append one ``a > b > c = value`` line per leaf scalar under ``node``.
+def _rag_flatten(node: "_IRNode", path: List[str], out: List[str]) -> None:
+    """Append one ``a > b > c = value`` line per leaf scalar under IR ``node``.
 
-    Lists share their owning key's path; each item re-derives its own
-    discriminator so siblings don't blur together. The key chosen as a node's
-    discriminator is folded into the path segment and not re-emitted as its own
-    leaf (that would just duplicate the segment).
+    ``path`` already holds ``node``'s own segment (tag + folded discriminator +
+    positional index) as its last element. Children are walked in **document
+    order**, so non-contiguously interleaved siblings keep their true position
+    instead of being pulled together by tag — the bug this rewrite fixes.
+
+    Emission order mirrors the source: mixed-content ``#text`` first, then
+    non-discriminator attributes, then children in order, then — only if the node
+    produced nothing else — the discriminator itself, so a sole-identity node
+    (e.g. a bare ``comment:note`` ``@value``) still surfaces its value
+    (:func:`rag_fidelity_check` enforces this).
     """
-    if isinstance(node, dict):
-        dkey, dsuf = _rag_discriminator(node)
-        if path:
-            seg = path[-1] + ("(%s)" % dsuf if dsuf else "")
-            here = path[:-1] + [seg]
+    before = len(out)
+    dkey, dsuf = _ir_discriminator(node)
+    if node.text is not None and path:
+        # Mixed content: the element has its own text alongside children (here
+        # always a positioned ``_comment``). The text is this element's value — on
+        # its own segment, not a spurious ``> #text`` child.
+        out.append("%s = %s" % (_RAG_SEP.join(path), _rag_leaf_value(node.text)))
+    for ak, av in node.attrs:
+        if dkey == "@" + ak:
+            continue  # the discriminator attribute is folded into the segment
+        out.append("%s = %s" % (_RAG_SEP.join(path + ["@" + ak]), _rag_leaf_value(av)))
+    segs = _ir_child_segments(node.children)
+    for (tag, child), seg in zip(node.children, segs):
+        if dkey == "name" and tag == "name":
+            continue  # the sole scalar <name> child folds into this node's segment
+        if not child.attrs and not child.children:
+            out.append("%s = %s" % (
+                _RAG_SEP.join(path + [seg]), _rag_leaf_value(child.text)))
         else:
-            here = path
-        before = len(out)
-        if "#text" in node and here:
-            # Mixed content: the element has its own text *plus* children (always a
-            # positioned ``_comment`` here). The text is this element's value — emit
-            # it on the element's own segment, not as a spurious ``> #text`` child.
-            out.append("%s = %s" % (_RAG_SEP.join(here), _rag_leaf_value(node["#text"])))
-        for k, v in node.items():
-            if k == dkey or k == "#text":
-                continue  # discriminator folds into the segment; #text handled above
-            _rag_flatten(v, here + [k], out)
-        if dkey is not None and len(out) == before:
-            # The discriminator was this node's ONLY content (e.g. a bare
-            # ``comment:note`` ``@value``); with no sibling leaf to carry it, emit
-            # it directly so the value isn't lost (rag_fidelity_check enforces this).
-            out.append("%s = %s" % (_RAG_SEP.join(here), _rag_leaf_value(node[dkey])))
-    elif isinstance(node, list):
-        for item in node:
-            _rag_flatten(item, path, out)
-    else:
-        out.append("%s = %s" % (_RAG_SEP.join(path), _rag_leaf_value(node)))
+            _rag_flatten(child, path + [seg], out)
+    if dkey is not None and len(out) == before:
+        out.append("%s = %s" % (
+            _RAG_SEP.join(path), _rag_leaf_value(dsuf.split("=", 1)[1])))
 
 
 def _rag_manifest(parsed: Any) -> str:
@@ -3006,10 +3213,14 @@ def xml_to_rag(raw: str) -> str:
     source structure; value-level fidelity is verifiable instead (every source
     leaf appears — :func:`rag_fidelity_check`).
 
-    Shares ``xml_to_yaml``'s parse (``xmltodict`` + positioned ``_comment`` nodes)
-    so comments and namespaces are carried. Raises ``RuntimeError`` if the
-    optional ``xmltodict`` package is missing; propagates ``expat.ExpatError`` on
-    malformed XML so the caller can fall back to lossless Markdown.
+    The leaves are flattened from the order-preserving :class:`_IRNode` tree
+    (:func:`_xml_to_ir`), so interleaved siblings keep document order and repeated
+    no-discriminator blocks are disambiguated positionally. The deterministic
+    summary is still gathered from the ``xmltodict`` parse (order-insensitive:
+    origins are de-duplicated and variables keyed by name). Positioned ``_comment``
+    nodes carry the comments; namespaces are preserved. Raises ``RuntimeError`` if
+    the optional ``xmltodict`` package is missing; propagates ``expat.ExpatError``
+    on malformed XML so the caller can fall back to lossless Markdown.
     """
     try:
         import xmltodict
@@ -3019,12 +3230,16 @@ def xml_to_rag(raw: str) -> str:
             "install them with:  pip install -r requirements.txt"
         ) from exc
 
-    parsed = xmltodict.parse(_xml_comments_to_elements(raw))
+    pre = _xml_comments_to_elements(raw)
+    parsed = xmltodict.parse(pre)  # order-insensitive summary only
+    root = _xml_to_ir(pre)
+    _, dsuf = _ir_discriminator(root)
+    rootseg = root.tag + ("(%s)" % dsuf if dsuf else "")
     leaves: List[str] = []
-    _rag_flatten(parsed, [], leaves)
+    _rag_flatten(root, [rootseg], leaves)
     return "".join([
         _rag_manifest(parsed),
-        "\n\n# FLATTENED CONFIGURATION (path-qualified leaves)\n\n",
+        "\n\n" + _RAG_FLATTEN_HEADER + "\n\n",
         "\n".join(leaves),
         "\n",
     ])
@@ -3832,17 +4047,40 @@ def _collect_xml_scalars(node: Any, out: List[str]) -> None:
 def rag_fidelity_check(
     content: str, source_xml: Optional[str]
 ) -> Tuple[Optional[bool], Optional[str]]:
-    """Value-level fidelity for ``--rag`` output: every source leaf value present.
+    """Fidelity for ``--rag`` output: every source value present, and every leaf
+    path unique.
 
     The flattened index intentionally does NOT round-trip to the source structure
-    (unlike :func:`yaml_fidelity_check`), so fidelity is verified at the value
-    level instead: collect every scalar leaf from the source XML and require each
-    to appear in the emitted text (whitespace-normalized to match
-    :func:`_rag_leaf_value`'s one-line rendering). A miss means the flattener
-    dropped a leaf. Returns ``(None, None)`` when no source is available.
+    (unlike :func:`yaml_fidelity_check`), so fidelity is verified two ways:
+
+    * **Value recall** — collect every scalar leaf from the source XML and require
+      each to appear in the emitted text (whitespace-normalized to match
+      :func:`_rag_leaf_value`). A miss means the flattener dropped a leaf.
+    * **Path uniqueness** — every flattened ``… = value`` record must have a
+      distinct left-hand path. A duplicate path is the signature of the merge bug
+      this rewrite fixes: repeated no-discriminator siblings (e.g. three
+      ``forward:origin-server``) collapsing onto one path with conflicting values.
+      Value recall can't see that (all the values are still *somewhere*), so this
+      guards it directly. :func:`_ir_child_segments` guarantees uniqueness by
+      construction, making this an effective regression gate.
+
+    Returns ``(None, None)`` when no source is available (value recall unassessable).
     """
     if source_xml is None:
         return None, None
+    # Path uniqueness runs over the flattened body only (the DOCUMENT SUMMARY's
+    # "(name = value)" header would otherwise be mistaken for a leaf record).
+    body = content.split(_RAG_FLATTEN_HEADER, 1)[-1]
+    paths = [ln.split(" = ", 1)[0] for ln in body.splitlines() if " = " in ln]
+    from collections import Counter
+
+    dupes = [p for p, c in Counter(paths).items() if c > 1]
+    if dupes:
+        sample = ", ".join(repr(p) for p in dupes[:3])
+        return False, (
+            "%d leaf path(s) are not unique — merged/reordered siblings (e.g. %s)"
+            % (len(dupes), sample)
+        )
     try:
         import xmltodict
 
@@ -3870,25 +4108,27 @@ def yaml_fidelity_check(
 ) -> Tuple[Optional[bool], Optional[str]]:
     """Verify ``--yaml`` output reproduces the source XML's structure exactly.
 
-    Re-parses the emitted YAML and compares it to ``xmltodict``'s parse of the
-    source XML. Because the conversion is
-    ``yaml.dump(xmltodict.parse(_xml_comments_to_elements(xml)))``, a faithful run
-    must satisfy ``safe_load(yaml) == xmltodict.parse(_xml_comments_to_elements(xml))``;
-    any mismatch means a bad parse/serialization path (e.g. a scalar that YAML
-    re-reads as a bool/null, or a dropped/misplaced comment), which this fails on
-    rather than shipping silently. The comment preprocessing mirrors
-    :func:`xml_to_yaml` so the comparison verifies the positioned ``_comment``
-    nodes too.
+    Re-parses the emitted YAML and compares it to the *order-preserving* canonical
+    object (:func:`_xml_to_yaml_obj`) — the same object :func:`xml_to_yaml` dumps.
+    A faithful run must therefore satisfy ``safe_load(yaml) == _xml_to_yaml_obj(...)``;
+    any mismatch means a bad serialization path (e.g. a scalar that YAML re-reads
+    as a bool/null, or a dropped/misplaced comment), which this fails on rather
+    than shipping silently.
+
+    The canonical object is compared, *not* ``xmltodict.parse``: xmltodict's by-tag
+    grouping discards the order of non-contiguously interleaved siblings, so using
+    it as the oracle would mask the very reordering the ordered projection exists
+    to preserve. The comment preprocessing mirrors :func:`xml_to_yaml` so the
+    comparison verifies the positioned ``_comment`` nodes too.
 
     Returns ``(None, None)`` when no source is available (fidelity unassessable).
     """
     if source_xml is None:
         return None, None
     try:
-        import xmltodict
         import yaml
 
-        expected = xmltodict.parse(_xml_comments_to_elements(source_xml))
+        expected = _xml_to_yaml_obj(_xml_comments_to_elements(source_xml))
         actual = yaml.safe_load(yaml_content)
     except Exception as exc:  # noqa: BLE001 - any failure means we can't vouch for it
         return False, "could not verify YAML fidelity: %s" % exc
