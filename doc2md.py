@@ -95,7 +95,7 @@ except ImportError:  # pragma: no cover - exercised only where PyMuPDF is absent
 # Configuration / defaults
 # --------------------------------------------------------------------------- #
 
-__version__ = "0.14.0"
+__version__ = "0.15.0"
 
 # Resolved once and cached. ``None`` when git or the repo is unavailable.
 _GIT_COMMIT_UNSET = object()
@@ -1750,6 +1750,77 @@ def convert_pdf(
         page_markers_applied=markers_applied,
         degenerate_tables=visual_stats.get("degenerate_tables", 0),
     )
+
+
+def convert_pdf_with_fallback(
+    src: Path,
+    dest: Path,
+    *,
+    quality: str = "standard",
+    preview_pages: Optional[int] = None,
+    visual_cfg: Optional[VisualConfig] = None,
+    clean: bool = True,
+    strip_patterns: Optional[List[str]] = None,
+    page_markers: bool = False,
+    reference_plaintext: Optional[str] = None,
+) -> Tuple[PdfConversion, Optional[Dict[str, str]]]:
+    """:func:`convert_pdf`, but auto-recover from a pdfmux silent content drop.
+
+    pdfmux's single-blob ``process()`` paths (Docling tables, the ``--quality
+    high`` LLM path, and the streaming-unavailable fallback) can silently drop a
+    whole text block while reporting high confidence — the layout/LLM model just
+    omits it, and confidence scores only what was emitted. When the first pass
+    lands on such a blob path *and* its order-insensitive content recall against
+    ``reference_plaintext`` falls below :data:`DEFAULT_CONTAINMENT_THRESHOLD`
+    (the drop signature), this re-extracts once on the faithful per-page path
+    (``quality="fast"`` → pymupdf4llm streaming, which has no table/LLM fidelity
+    to lose) and keeps whichever output has the higher recall. ``dest`` is left
+    holding the chosen conversion's Markdown.
+
+    Returns ``(conversion, fallback_decision)`` — the decision is a reportable
+    :func:`_note_auto_decision` record when a fallback was taken, else ``None``.
+    Recovery only fires when ``reference_plaintext`` is available (needs a text
+    baseline to measure the drop) and the first pass was not already ``fast``.
+    """
+    conv = convert_pdf(
+        src, dest, quality=quality, preview_pages=preview_pages,
+        visual_cfg=visual_cfg, clean=clean, strip_patterns=strip_patterns,
+        page_markers=page_markers,
+    )
+    blob_path = conv.page_source.startswith("process")
+    if reference_plaintext is None or quality == "fast" or not blob_path:
+        return conv, None
+
+    recall = _containment_ratio(reference_plaintext, conv.markdown)
+    if recall >= DEFAULT_CONTAINMENT_THRESHOLD:
+        return conv, None
+
+    # Drop signature: re-extract on the faithful per-page path and keep the more
+    # complete result (recovery must never make recall worse).
+    alt = convert_pdf(
+        src, dest, quality="fast", preview_pages=preview_pages,
+        visual_cfg=visual_cfg, clean=clean, strip_patterns=strip_patterns,
+        page_markers=page_markers,
+    )
+    alt_recall = _containment_ratio(reference_plaintext, alt.markdown)
+    if alt_recall > recall:
+        decision = {
+            "setting": "extraction-fallback",
+            "choice": "quality=fast",
+            "reason": (
+                "pdfmux %s path recall %.2f below %.2f (content silently dropped) "
+                "— re-extracted on the faithful per-page path (recall %.2f)"
+                % (conv.page_source, recall, DEFAULT_CONTAINMENT_THRESHOLD, alt_recall)
+            ),
+            "override": "--quality standard (keep the Docling table path)",
+        }
+        return alt, decision
+
+    # Faithful path was no better (e.g. streaming unavailable, or the loss is
+    # image-only content) — restore the original output to ``dest`` and let the
+    # normal fidelity gate report on it.
+    dest.write_text(conv.markdown, encoding="utf-8")
+    return conv, None
 
 
 def convert_with_pandoc(
@@ -4430,11 +4501,18 @@ def process_file(
             # LLM path (quality="high") doesn't, so don't claim a decision there.
             if eff_quality != "high":
                 _note_auto_decision(record, _ocr_decision(src, ocr_mode))
-            conv = convert_pdf(
+            # Text baseline for the fidelity gate, computed up front so the
+            # auto-fallback can measure a silent content drop against it.
+            if deps.get("pdftotext"):
+                original_plaintext = extract_pdf_plaintext(src, last_page=preview_pages)
+            conv, fallback_decision = convert_pdf_with_fallback(
                 src, dest, quality=eff_quality, preview_pages=preview_pages,
                 visual_cfg=visual_cfg, clean=clean, strip_patterns=strip_patterns,
-                page_markers=rag_metadata,
+                page_markers=rag_metadata, reference_plaintext=original_plaintext,
             )
+            if fallback_decision is not None:
+                fm_quality = "fast"  # stamp the tier that actually produced the output
+                _note_auto_decision(record, fallback_decision, announce=True)
             markdown = conv.markdown
             confidence = conv.confidence
             extraction_source = conv.page_source
@@ -4460,8 +4538,6 @@ def process_file(
                     _note_auto_decision(
                         record, pm_decision, announce=pm_decision["choice"] == "off"
                     )
-            if deps.get("pdftotext"):
-                original_plaintext = extract_pdf_plaintext(src, last_page=preview_pages)
         elif fmt in ("mhtml", "html", "docx"):
             record.converter = {"mhtml": "mhtml", "html": "html"}.get(fmt, "pandoc(docx)")
             wc = convert_word(
@@ -4974,7 +5050,10 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="pdfmux local extraction quality. 'auto' (default): 'standard' "
         "(max local effort), but 'fast' for very large PDFs (> --large-doc-pages) "
         "where Docling's per-page cost isn't worth it. 'fast' = PyMuPDF only; "
-        "'high' implies cloud LLM — prefer --llm for that.",
+        "'high' implies cloud LLM — prefer --llm for that. If a Docling/LLM "
+        "extraction silently drops content (recall below the fidelity gate), the "
+        "doc is auto-re-extracted on the faithful 'fast' path and the more "
+        "complete output kept (reported as an 'extraction-fallback' decision).",
     )
     parser.add_argument(
         "--large-doc-pages", type=int, default=DEFAULT_LARGE_DOC_PAGES, metavar="N",
