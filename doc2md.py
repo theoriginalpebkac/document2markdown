@@ -95,7 +95,7 @@ except ImportError:  # pragma: no cover - exercised only where PyMuPDF is absent
 # Configuration / defaults
 # --------------------------------------------------------------------------- #
 
-__version__ = "0.13.0"
+__version__ = "0.14.0"
 
 # Resolved once and cached. ``None`` when git or the repo is unavailable.
 _GIT_COMMIT_UNSET = object()
@@ -4147,6 +4147,7 @@ def validate(
     min_confidence: float = DEFAULT_MIN_CONFIDENCE,
     output_format: str = "markdown",
     source_xml: Optional[str] = None,
+    extraction_source: Optional[str] = None,
 ) -> Dict[str, object]:
     """Run fidelity + confidence + structural checks and decide pass/fail.
 
@@ -4180,6 +4181,18 @@ def validate(
     checks for a summary block plus path-qualified leaves, and verifies fidelity
     at the value level — every source leaf must appear (it deliberately does not
     round-trip).
+
+    ``extraction_source`` is the pdfmux path that produced the text (see
+    :func:`_extract_pdf_pages`). The single-blob ``process()`` paths
+    (``"process-tables"`` = Docling, ``"process-llm"``, ``"process-fallback"``)
+    return only the text the extractor chose to emit, and pdfmux/Docling
+    confidence scores just that text — it is blind to a block the layout model
+    silently discarded. So on those paths a low order-insensitive **content
+    recall** is treated as real content loss and fails the document *regardless*
+    of confidence, closing the hole where a confident Docling extraction that
+    dropped a bullet list still passed. The faithful per-page ``"streaming"``
+    path (and non-PDF inputs) keep the lenient rule, since a low recall there is
+    usually a pdftotext line-wrap artifact rather than a drop.
     """
     fidelity_ok: Optional[bool] = None
     fidelity_reason: Optional[str] = None
@@ -4226,8 +4239,16 @@ def validate(
     # either a confident extractor signal (pdfmux) OR high order-insensitive
     # content recall vouches for it; the low score stays visible in the report.
     sim_fatal = (sim_ok is False) and (conf_ok is not True) and (content_ok is not True)
+    # On the single-blob process() paths (Docling tables / LLM / fallback), the
+    # extractor's confidence covers only the text it emitted and cannot vouch for
+    # content it silently dropped — so a low order-insensitive recall there is a
+    # hard failure that high confidence does NOT rescue. Streaming/non-PDF keep
+    # the lenient rule (low recall is usually a pdftotext line-wrap artifact).
+    blob_extraction = bool(extraction_source) and extraction_source.startswith("process")
+    recall_fatal = (content_ok is False) and blob_extraction
     passed = (
         (not sim_fatal)
+        and (not recall_fatal)
         and (conf_ok is not False)
         and (fidelity_ok is not False)
         and not struct_fatal
@@ -4388,6 +4409,7 @@ def process_file(
     try:
         original_plaintext: Optional[str] = None
         confidence: Optional[float] = None
+        extraction_source: Optional[str] = None  # PDF: pdfmux path (see _extract_pdf_pages)
         output_format = "markdown"
         source_xml: Optional[str] = None
         fm_quality: Optional[str] = None  # frontmatter: resolved quality tier (PDF)
@@ -4415,6 +4437,7 @@ def process_file(
             )
             markdown = conv.markdown
             confidence = conv.confidence
+            extraction_source = conv.page_source
             record.pdfmux_confidence = conv.confidence
             record.min_page_confidence = conv.min_page_confidence
             record.figures = _figure_counts(conv.visuals)
@@ -4576,6 +4599,7 @@ def process_file(
             min_confidence=min_confidence,
             output_format=output_format,
             source_xml=source_xml,
+            extraction_source=extraction_source,
         )
         record.similarity = result["similarity"]  # type: ignore[assignment]
         record.similarity_method = result["similarity_method"]  # type: ignore[assignment]
@@ -4671,7 +4695,12 @@ def print_summary(records: List[FileRecord], top_n: int = 10) -> None:
 
     for r in failed:
         reasons = []
-        if r.similarity_ok is False:
+        if r.content_recall is not None and r.content_recall < DEFAULT_CONTAINMENT_THRESHOLD:
+            reasons.append(
+                "low content recall %.2f — source content missing from output"
+                % r.content_recall
+            )
+        elif r.similarity_ok is False:
             reasons.append("low similarity %.3f" % (r.similarity or 0.0))
         if r.confidence_ok is False:
             reasons.append("low confidence %.2f" % (r.pdfmux_confidence or 0.0))
